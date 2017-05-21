@@ -65,7 +65,7 @@ add_builtin_argument('errorlogs', action='store_false')
 parser.add_argument('--cross-file', default=None,
                     help='File describing cross compilation environment.')
 parser.add_argument('-D', action='append', dest='projectoptions', default=[],
-                    help='Set project options.')
+                    help='Set a project option, can be used several times to set multiple options.')
 parser.add_argument('-v', '--version', action='version',
                     version=coredata.version)
                     # See the mesonlib.WrapMode enum for documentation
