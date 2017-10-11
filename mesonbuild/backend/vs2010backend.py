@@ -22,9 +22,8 @@ from .. import build
 from .. import dependencies
 from .. import mlog
 from .. import compilers
-from ..build import BuildTarget
 from ..compilers import CompilerArgs
-from ..mesonlib import MesonException, File, get_meson_script
+from ..mesonlib import MesonException, File
 from ..environment import Environment
 
 def autodetect_vs_version(build):
@@ -80,38 +79,9 @@ class Vs2010Backend(backends.Backend):
         super().__init__(build)
         self.name = 'vs2010'
         self.project_file_version = '10.0.30319.1'
-        self.sources_conflicts = {}
         self.platform_toolset = None
         self.vs_version = '2010'
         self.windows_target_platform_version = None
-
-    def object_filename_from_source(self, target, source, is_unity=False):
-        basename = os.path.basename(source.fname)
-        filename_without_extension = '.'.join(basename.split('.')[:-1])
-        if basename in self.sources_conflicts[target.get_id()]:
-            # If there are multiple source files with the same basename, we must resolve the conflict
-            # by giving each a unique object output file.
-            filename_without_extension = '.'.join(source.fname.split('.')[:-1]).replace('/', '_').replace('\\', '_')
-        return filename_without_extension + '.' + self.environment.get_object_suffix()
-
-    def resolve_source_conflicts(self):
-        for name, target in self.build.targets.items():
-            if not isinstance(target, BuildTarget):
-                continue
-            conflicts = {}
-            for s in target.get_sources():
-                if hasattr(s, 'held_object'):
-                    s = s.held_object
-                if not isinstance(s, File):
-                    continue
-                basename = os.path.basename(s.fname)
-                conflicting_sources = conflicts.get(basename, None)
-                if conflicting_sources is None:
-                    conflicting_sources = []
-                    conflicts[basename] = conflicting_sources
-                conflicting_sources.append(s)
-            self.sources_conflicts[target.get_id()] = {name: src_conflicts for name, src_conflicts in conflicts.items()
-                                                       if len(src_conflicts) > 1}
 
     def generate_custom_generator_commands(self, target, parent_node):
         generator_output_files = []
@@ -121,7 +91,7 @@ class Vs2010Backend(backends.Backend):
         source_target_dir = self.get_target_source_dir(target)
         down = self.target_to_build_root(target)
         for genlist in target.get_generated_sources():
-            if isinstance(genlist, build.CustomTarget):
+            if isinstance(genlist, (build.CustomTarget, build.CustomTargetIndex)):
                 for i in genlist.get_outputs():
                     # Path to the generated source from the current vcxproj dir via the build root
                     ipath = os.path.join(down, self.get_target_dir(genlist), i)
@@ -135,7 +105,6 @@ class Vs2010Backend(backends.Backend):
                 infilelist = genlist.get_inputs()
                 outfilelist = genlist.get_outputs()
                 exe_arr = self.exe_object_to_cmd_array(exe)
-                base_args = generator.get_arglist()
                 idgroup = ET.SubElement(parent_node, 'ItemGroup')
                 for i in range(len(infilelist)):
                     if len(infilelist) == len(outfilelist):
@@ -144,6 +113,7 @@ class Vs2010Backend(backends.Backend):
                         sole_output = ''
                     curfile = infilelist[i]
                     infilename = os.path.join(down, curfile.rel_to_builddir(self.build_to_src))
+                    base_args = generator.get_arglist(infilename)
                     outfiles_rel = genlist.get_outputs_for(curfile)
                     outfiles = [os.path.join(target_private_dir, of) for of in outfiles_rel]
                     generator_output_files += outfiles
@@ -158,13 +128,22 @@ class Vs2010Backend(backends.Backend):
                              .replace("@BUILD_ROOT@", self.environment.get_build_dir())
                             for x in args]
                     cmd = exe_arr + self.replace_extra_args(args, genlist)
+                    if generator.capture:
+                        exe_data = self.serialize_executable(
+                            cmd[0],
+                            cmd[1:],
+                            self.environment.get_build_dir(),
+                            capture=outfiles[0]
+                        )
+                        cmd = self.environment.get_build_command() + ['--internal', 'exe', exe_data]
+                        abs_pdir = os.path.join(self.environment.get_build_dir(), self.get_target_dir(target))
+                        os.makedirs(abs_pdir, exist_ok=True)
                     cbs = ET.SubElement(idgroup, 'CustomBuild', Include=infilename)
                     ET.SubElement(cbs, 'Command').text = ' '.join(self.quote_arguments(cmd))
                     ET.SubElement(cbs, 'Outputs').text = ';'.join(outfiles)
         return generator_output_files, custom_target_output_files, custom_target_include_dirs
 
     def generate(self, interp):
-        self.resolve_source_conflicts()
         self.interpreter = interp
         target_machine = self.interpreter.builtin['target_machine'].cpu_family_method(None, None)
         if target_machine.endswith('64'):
@@ -232,6 +211,8 @@ class Vs2010Backend(backends.Backend):
                 for gendep in target.get_generated_sources():
                     if isinstance(gendep, build.CustomTarget):
                         all_deps[gendep.get_id()] = gendep
+                    elif isinstance(gendep, build.CustomTargetIndex):
+                        all_deps[gendep.target.get_id()] = gendep.target
                     else:
                         gen_exe = gendep.generator.get_exe()
                         if isinstance(gen_exe, build.Executable):
@@ -363,6 +344,11 @@ class Vs2010Backend(backends.Backend):
     def quote_arguments(self, arr):
         return ['"%s"' % i for i in arr]
 
+    def add_project_reference(self, root, include, projid):
+        ig = ET.SubElement(root, 'ItemGroup')
+        pref = ET.SubElement(ig, 'ProjectReference', Include=include)
+        ET.SubElement(pref, 'Project').text = '{%s}' % projid
+
     def create_basic_crap(self, target):
         project_name = target.name
         root = ET.Element('Project', {'DefaultTargets': "Build",
@@ -413,8 +399,7 @@ class Vs2010Backend(backends.Backend):
         cmd = [sys.executable, os.path.join(self.environment.get_script_dir(), 'commandrunner.py'),
                self.environment.get_build_dir(),
                self.environment.get_source_dir(),
-               self.get_target_dir(target),
-               get_meson_script(self.environment, 'mesonintrospect')]
+               self.get_target_dir(target)] + self.environment.get_build_command()
         for i in cmd_raw:
             if isinstance(i, build.BuildTarget):
                 cmd.append(os.path.join(self.environment.get_build_dir(), self.get_target_filename(i)))
@@ -447,8 +432,7 @@ class Vs2010Backend(backends.Backend):
                                              # All targets run from the target dir
                                              tdir_abs,
                                              capture=ofilenames[0] if target.capture else None)
-        wrapper_cmd = [sys.executable, self.environment.get_build_command(),
-                       '--internal', 'exe', exe_data]
+        wrapper_cmd = self.environment.get_build_command() + ['--internal', 'exe', exe_data]
         ET.SubElement(customstep, 'Command').text = ' '.join(self.quote_arguments(wrapper_cmd))
         ET.SubElement(customstep, 'Outputs').text = ';'.join(ofilenames)
         ET.SubElement(customstep, 'Inputs').text = ';'.join([exe_data] + srcs + depend_files)
@@ -558,6 +542,8 @@ class Vs2010Backend(backends.Backend):
                 if lpath in lpaths:
                     lpaths.remove(lpath)
                 lpaths.append(lpath)
+            elif arg.startswith(('/', '-')):
+                other.append(arg)
             # It's ok if we miss libraries with non-standard extensions here.
             # They will go into the general link arguments.
             elif arg.endswith('.lib') or arg.endswith('.a'):
@@ -764,6 +750,10 @@ class Vs2010Backend(backends.Backend):
             # This is where Visual Studio will insert target_args, target_defines,
             # etc, which are added later from external deps (see below).
             args += ['%(AdditionalOptions)', '%(PreprocessorDefinitions)', '%(AdditionalIncludeDirectories)']
+            # Add custom target dirs as includes automatically, but before
+            # target-specific include dirs. See _generate_single_compile() in
+            # the ninja backend for caveats.
+            args += ['-I' + arg for arg in generated_files_include_dirs]
             # Add include dirs from the `include_directories:` kwarg on the target
             # and from `include_directories:` of internal deps of the target.
             #
@@ -790,12 +780,14 @@ class Vs2010Backend(backends.Backend):
             if l in file_args:
                 file_args[l] += args
         # The highest priority includes. In order of directory search:
-        # target private dir, target build dir, generated sources include dirs,
-        # target source dir
+        # target private dir, target build dir, target source dir
         for args in file_args.values():
-            t_inc_dirs = ['.', self.relpath(self.get_target_private_dir(target),
-                                            self.get_target_dir(target))]
-            t_inc_dirs += generated_files_include_dirs + [proj_to_src_dir]
+            t_inc_dirs = [self.relpath(self.get_target_private_dir(target),
+                                       self.get_target_dir(target))]
+            if target.implicit_include_directories:
+                t_inc_dirs += ['.']
+            if target.implicit_include_directories:
+                t_inc_dirs += [proj_to_src_dir]
             args += ['-I' + arg for arg in t_inc_dirs]
 
         # Split preprocessor defines and include directories out of the list of
@@ -922,20 +914,26 @@ class Vs2010Backend(backends.Backend):
         # *_winlibs that we want to link to are static mingw64 libraries.
         extra_link_args += compiler.get_option_link_args(self.environment.coredata.compiler_options)
         (additional_libpaths, additional_links, extra_link_args) = self.split_link_args(extra_link_args.to_native())
-        if len(extra_link_args) > 0:
-            extra_link_args.append('%(AdditionalOptions)')
-            ET.SubElement(link, "AdditionalOptions").text = ' '.join(extra_link_args)
-        if len(additional_libpaths) > 0:
-            additional_libpaths.insert(0, '%(AdditionalLibraryDirectories)')
-            ET.SubElement(link, 'AdditionalLibraryDirectories').text = ';'.join(additional_libpaths)
 
         # Add more libraries to be linked if needed
         for t in target.get_dependencies():
             lobj = self.build.targets[t.get_id()]
             linkname = os.path.join(down, self.get_target_filename_for_linking(lobj))
             if t in target.link_whole_targets:
-                linkname = compiler.get_link_whole_for(linkname)[0]
-            additional_links.append(linkname)
+                # /WHOLEARCHIVE:foo must go into AdditionalOptions
+                extra_link_args += compiler.get_link_whole_for(linkname)
+                # To force Visual Studio to build this project even though it
+                # has no sources, we include a reference to the vcxproj file
+                # that builds this target. Technically we should add this only
+                # if the current target has no sources, but it doesn't hurt to
+                # have 'extra' references.
+                trelpath = self.get_target_dir_relative_to(t, target)
+                tvcxproj = os.path.join(trelpath, t.get_id() + '.vcxproj')
+                tid = self.environment.coredata.target_guids[t.get_id()]
+                self.add_project_reference(root, tvcxproj, tid)
+            else:
+                # Other libraries go into AdditionalDependencies
+                additional_links.append(linkname)
         for lib in self.get_custom_target_provided_libraries(target):
             additional_links.append(self.relpath(lib, self.get_target_dir(target)))
         additional_objects = []
@@ -944,6 +942,13 @@ class Vs2010Backend(backends.Backend):
             additional_objects.append(o)
         for o in custom_objs:
             additional_objects.append(o)
+
+        if len(extra_link_args) > 0:
+            extra_link_args.append('%(AdditionalOptions)')
+            ET.SubElement(link, "AdditionalOptions").text = ' '.join(extra_link_args)
+        if len(additional_libpaths) > 0:
+            additional_libpaths.insert(0, '%(AdditionalLibraryDirectories)')
+            ET.SubElement(link, 'AdditionalLibraryDirectories').text = ';'.join(additional_libpaths)
         if len(additional_links) > 0:
             additional_links.append('%(AdditionalDependencies)')
             ET.SubElement(link, 'AdditionalDependencies').text = ';'.join(additional_links)
@@ -951,10 +956,11 @@ class Vs2010Backend(backends.Backend):
         ofile.text = '$(OutDir)%s' % target.get_filename()
         subsys = ET.SubElement(link, 'SubSystem')
         subsys.text = subsystem
-        if isinstance(target, build.SharedLibrary):
+        if (isinstance(target, build.SharedLibrary) or isinstance(target, build.Executable)) and target.get_import_filename():
             # DLLs built with MSVC always have an import library except when
             # they're data-only DLLs, but we don't support those yet.
             ET.SubElement(link, 'ImportLibrary').text = target.get_import_filename()
+        if isinstance(target, build.SharedLibrary):
             # Add module definitions file, if provided
             if target.vs_module_defs:
                 relpath = os.path.join(down, target.vs_module_defs.rel_to_builddir(self.build_to_src))
@@ -997,9 +1003,7 @@ class Vs2010Backend(backends.Backend):
                 self.add_additional_options(lang, inc_cl, file_args)
                 self.add_preprocessor_defines(lang, inc_cl, file_defines)
                 self.add_include_dirs(lang, inc_cl, file_inc_dirs)
-                basename = os.path.basename(s.fname)
-                if basename in self.sources_conflicts[target.get_id()]:
-                    ET.SubElement(inc_cl, 'ObjectFileName').text = "$(IntDir)" + self.object_filename_from_source(target, s)
+                ET.SubElement(inc_cl, 'ObjectFileName').text = "$(IntDir)" + self.object_filename_from_source(target, s, False)
             for s in gen_src:
                 inc_cl = ET.SubElement(inc_src, 'CLCompile', Include=s)
                 lang = Vs2010Backend.lang_from_source_file(s)
@@ -1034,9 +1038,8 @@ class Vs2010Backend(backends.Backend):
 
         ET.SubElement(root, 'Import', Project='$(VCTargetsPath)\Microsoft.Cpp.targets')
         # Reference the regen target.
-        ig = ET.SubElement(root, 'ItemGroup')
-        pref = ET.SubElement(ig, 'ProjectReference', Include=os.path.join(self.environment.get_build_dir(), 'REGEN.vcxproj'))
-        ET.SubElement(pref, 'Project').text = self.environment.coredata.regen_guid
+        regen_vcxproj = os.path.join(self.environment.get_build_dir(), 'REGEN.vcxproj')
+        self.add_project_reference(root, regen_vcxproj, self.environment.coredata.regen_guid)
         self._prettyprint_vcxproj_xml(ET.ElementTree(root), ofname)
 
     def gen_regenproj(self, project_name, ofname):
@@ -1087,10 +1090,7 @@ class Vs2010Backend(backends.Backend):
         ET.SubElement(midl, 'TypeLibraryName').text = '%(Filename).tlb'
         ET.SubElement(midl, 'InterfaceIdentifierFilename').text = '%(Filename)_i.c'
         ET.SubElement(midl, 'ProxyFileName').text = '%(Filename)_p.c'
-        regen_command = [sys.executable,
-                         self.environment.get_build_command(),
-                         '--internal',
-                         'regencheck']
+        regen_command = self.environment.get_build_command() + ['--internal', 'regencheck']
         private_dir = self.environment.get_scratch_dir()
         cmd_templ = '''setlocal
 "%s" "%s"
@@ -1170,9 +1170,7 @@ if %%errorlevel%% neq 0 goto :VCEnd'''
         postbuild = ET.SubElement(action, 'PostBuildEvent')
         ET.SubElement(postbuild, 'Message')
         # FIXME: No benchmarks?
-        test_command = [sys.executable,
-                        get_meson_script(self.environment, 'mesontest'),
-                        '--no-rebuild']
+        test_command = self.environment.get_build_command() + ['test', '--no-rebuild']
         if not self.environment.coredata.get_builtin_option('stdsplit'):
             test_command += ['--no-stdsplit']
         if self.environment.coredata.get_builtin_option('errorlogs'):

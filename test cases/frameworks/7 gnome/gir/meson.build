@@ -27,8 +27,13 @@ gnome.generate_gir(
   identifier_prefix : 'Meson',
   includes : ['GObject-2.0', 'MesonDep1-1.0'],
   # dep1_dep pulls in dep2_dep for us
-  dependencies : [fake_dep, dep1_dep],
-  install : true
+  dependencies : [[fake_dep, dep1_dep]],
+  install : true,
+  build_by_default : true,
+  # Test that unknown kwargs do not crash the parser.
+  # Unknown kwargs will eventually become a hard error.
+  # Once that happens remove this.
+  unknown_kwarg : true,
 )
 
 test('gobject introspection/c', girexe)

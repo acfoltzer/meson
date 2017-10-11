@@ -62,11 +62,19 @@ class permittedKwargs:
 
     def __call__(self, f):
         @wraps(f)
-        def wrapped(s, node, args, kwargs):
+        def wrapped(s, node_or_state, args, kwargs):
+            if hasattr(s, 'subdir'):
+                subdir = s.subdir
+                lineno = s.current_lineno
+            elif hasattr(node_or_state, 'subdir'):
+                subdir = node_or_state.subdir
+                lineno = node_or_state.current_lineno
             for k in kwargs:
                 if k not in self.permitted:
-                    mlog.warning('Passed invalid keyword argument "%s". This will become a hard error in the future.' % k)
-            return f(s, node, args, kwargs)
+                    fname = os.path.join(subdir, environment.build_filename)
+                    mlog.warning('''Passed invalid keyword argument "%s" in %s line %d.
+This will become a hard error in the future.''' % (k, fname, lineno))
+            return f(s, node_or_state, args, kwargs)
         return wrapped
 
 
@@ -101,6 +109,7 @@ class InterpreterBase:
         self.subdir = subdir
         self.variables = {}
         self.argument_depth = 0
+        self.current_lineno = -1
 
     def load_root_meson_file(self):
         mesonfile = os.path.join(self.source_root, self.subdir, environment.build_filename)
@@ -151,6 +160,7 @@ class InterpreterBase:
         while i < len(statements):
             cur = statements[i]
             try:
+                self.current_lineno = cur.lineno
                 self.evaluate_statement(cur)
             except Exception as e:
                 if not(hasattr(e, 'lineno')):
@@ -359,14 +369,16 @@ class InterpreterBase:
     def evaluate_indexing(self, node):
         assert(isinstance(node, mparser.IndexNode))
         iobject = self.evaluate_statement(node.iobject)
-        if not isinstance(iobject, list):
-            raise InterpreterException('Tried to index a non-array object.')
+        if not hasattr(iobject, '__getitem__'):
+            raise InterpreterException(
+                'Tried to index an object that doesn\'t support indexing.')
         index = self.evaluate_statement(node.index)
         if not isinstance(index, int):
             raise InterpreterException('Index value is not an integer.')
-        if index < -len(iobject) or index >= len(iobject):
+        try:
+            return iobject[index]
+        except IndexError:
             raise InterpreterException('Index %d out of bounds of array of size %d.' % (index, len(iobject)))
-        return iobject[index]
 
     def function_call(self, node):
         func_name = node.func_name
@@ -440,9 +452,25 @@ class InterpreterBase:
         else:
             raise InterpreterException('Unknown method "%s" for an integer.' % method_name)
 
+    @staticmethod
+    def _get_one_string_posarg(posargs, method_name):
+        if len(posargs) > 1:
+            m = '{}() must have zero or one arguments'
+            raise InterpreterException(m.format(method_name))
+        elif len(posargs) == 1:
+            s = posargs[0]
+            if not isinstance(s, str):
+                m = '{}() argument must be a string'
+                raise InterpreterException(m.format(method_name))
+            return s
+        return None
+
     def string_method_call(self, obj, method_name, args):
         (posargs, _) = self.reduce_arguments(args)
         if method_name == 'strip':
+            s = self._get_one_string_posarg(posargs, 'strip')
+            if s is not None:
+                return obj.strip(s)
             return obj.strip()
         elif method_name == 'format':
             return self.format_string(obj, args)
@@ -453,15 +481,10 @@ class InterpreterBase:
         elif method_name == 'underscorify':
             return re.sub(r'[^a-zA-Z0-9]', '_', obj)
         elif method_name == 'split':
-            if len(posargs) > 1:
-                raise InterpreterException('Split() must have at most one argument.')
-            elif len(posargs) == 1:
-                s = posargs[0]
-                if not isinstance(s, str):
-                    raise InterpreterException('Split() argument must be a string')
+            s = self._get_one_string_posarg(posargs, 'split')
+            if s is not None:
                 return obj.split(s)
-            else:
-                return obj.split()
+            return obj.split()
         elif method_name == 'startswith' or method_name == 'contains' or method_name == 'endswith':
             s = posargs[0]
             if not isinstance(s, str):

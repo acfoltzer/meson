@@ -19,7 +19,7 @@ from .. import mesonlib
 from .. import mlog
 from . import ModuleReturnValue
 from . import ExtensionModule
-from . import permittedKwargs
+from ..interpreterbase import permittedKwargs
 
 
 class PkgConfigModule(ExtensionModule):
@@ -97,18 +97,18 @@ class PkgConfigModule(ExtensionModule):
                 ofile.write('Libs.private: {}\n'.format(' '.join(generate_libs_flags(priv_libs))))
             ofile.write('Cflags:')
             for h in subdirs:
-                if h == '.':
-                    h = ''
                 ofile.write(' ')
-                ofile.write(os.path.join('-I${includedir}', h))
+                if h == '.':
+                    ofile.write('-I${includedir}')
+                else:
+                    ofile.write(os.path.join('-I${includedir}', h))
             for f in extra_cflags:
                 ofile.write(' ')
                 ofile.write(f)
             ofile.write('\n')
 
     def process_libs(self, libs):
-        if not isinstance(libs, list):
-            libs = [libs]
+        libs = mesonlib.listify(libs)
         processed_libs = []
         for l in libs:
             if hasattr(l, 'held_object'):
@@ -120,7 +120,7 @@ class PkgConfigModule(ExtensionModule):
 
     @permittedKwargs({'libraries', 'version', 'name', 'description', 'filebase',
                       'subdirs', 'requires', 'requires_private', 'libraries_private',
-                      'install_dir', 'extra_cflags', 'variables'})
+                      'install_dir', 'extra_cflags', 'variables', 'url', 'd_module_versions'})
     def generate(self, state, args, kwargs):
         if len(args) > 0:
             raise mesonlib.MesonException('Pkgconfig_gen takes no positional arguments.')
@@ -147,6 +147,12 @@ class PkgConfigModule(ExtensionModule):
         conflicts = mesonlib.stringlistify(kwargs.get('conflicts', []))
         extra_cflags = mesonlib.stringlistify(kwargs.get('extra_cflags', []))
 
+        dversions = kwargs.get('d_module_versions', None)
+        if dversions:
+            compiler = state.environment.coredata.compilers.get('d')
+            if compiler:
+                extra_cflags.extend(compiler.get_feature_args({'versions': dversions}))
+
         def parse_variable_list(stringlist):
             reserved = ['prefix', 'libdir', 'includedir']
             variables = []
@@ -154,11 +160,11 @@ class PkgConfigModule(ExtensionModule):
                 # foo=bar=baz is ('foo', 'bar=baz')
                 l = var.split('=', 1)
                 if len(l) < 2:
-                    raise mesonlib.MesonException('Variables must be in \'name=value\' format')
+                    raise mesonlib.MesonException('Invalid variable "{}". Variables must be in \'name=value\' format'.format(var))
 
                 name, value = l[0].strip(), l[1].strip()
                 if not name or not value:
-                    raise mesonlib.MesonException('Variables must be in \'name=value\' format')
+                    raise mesonlib.MesonException('Invalid variable "{}". Variables must be in \'name=value\' format'.format(var))
 
                 # Variable names must not contain whitespaces
                 if any(c.isspace() for c in name):

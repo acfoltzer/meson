@@ -18,7 +18,8 @@ from .. import mesonlib, dependencies
 
 from . import ExtensionModule
 from mesonbuild.modules import ModuleReturnValue
-from . import noKwargs, permittedSnippetKwargs
+from . import permittedSnippetKwargs
+from ..interpreterbase import noKwargs
 from ..interpreter import shlib_kwargs
 
 mod_kwargs = set()
@@ -68,7 +69,7 @@ class Python3Module(ExtensionModule):
             raise mesonlib.MesonException('{} is not a valid path name {}.'.format(path_name, valid_names))
 
         # Get a relative path without a prefix, e.g. lib/python3.6/site-packages
-        path = sysconfig.get_path(path_name, vars={'base': ''})[1:]
+        path = sysconfig.get_path(path_name, vars={'base': '', 'platbase': '', 'installed_base': ''})[1:]
         return ModuleReturnValue(path, [])
 
 

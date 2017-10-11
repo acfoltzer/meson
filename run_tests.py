@@ -90,7 +90,7 @@ def get_backend_commands(backend, debug=False):
         test_cmd = cmd + ['-target', 'RUN_TESTS']
     elif backend is Backend.ninja:
         # We need at least 1.6 because of -w dupbuild=err
-        cmd = [detect_ninja('1.6'), '-w', 'dupbuild=err']
+        cmd = [detect_ninja('1.6'), '-w', 'dupbuild=err', '-d', 'explain']
         if cmd[0] is None:
             raise RuntimeError('Could not find Ninja v1.6 or newer')
         if debug:
@@ -104,6 +104,12 @@ def get_backend_commands(backend, debug=False):
     return cmd, clean_cmd, test_cmd, install_cmd, uninstall_cmd
 
 def ensure_backend_detects_changes(backend):
+    # We're using a ninja with QuLogic's patch for sub-1s resolution timestamps
+    # and not running on HFS+ which only stores dates in seconds:
+    # https://developer.apple.com/legacy/library/technotes/tn/tn1150.html#HFSPlusDates
+    # FIXME: Upgrade Travis image to Apple FS when that becomes available
+    if 'MESON_FIXED_NINJA' in os.environ and not mesonlib.is_osx():
+        return
     # This is needed to increase the difference between build.ninja's
     # timestamp and the timestamp of whatever you changed due to a Ninja
     # bug: https://github.com/ninja-build/ninja/issues/371
@@ -119,7 +125,7 @@ def get_fake_options(prefix):
     return opts
 
 def should_run_linux_cross_tests():
-    return shutil.which('arm-linux-gnueabihf-gcc-6') and not platform.machine().startswith('arm')
+    return shutil.which('arm-linux-gnueabihf-gcc-6') and not platform.machine().lower().startswith('arm')
 
 def run_configure_inprocess(commandlist):
     old_stdout = sys.stdout
@@ -127,7 +133,7 @@ def run_configure_inprocess(commandlist):
     old_stderr = sys.stderr
     sys.stderr = mystderr = StringIO()
     try:
-        returncode = mesonmain.run(commandlist[0], commandlist[1:])
+        returncode = mesonmain.run(commandlist[1:], commandlist[0])
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
@@ -142,7 +148,17 @@ class FakeEnvironment(object):
     def is_cross_build(self):
         return False
 
+def print_system_info():
+    print(mlog.bold('System information.').get_text(mlog.colorize_console))
+    print('Architecture:', platform.architecture())
+    print('Machine:', platform.machine())
+    print('Platform:', platform.system())
+    print('Processor:', platform.processor())
+    print('System:', platform.system())
+    print('')
+
 if __name__ == '__main__':
+    print_system_info()
     # Enable coverage early...
     enable_coverage = '--cov' in sys.argv
     if enable_coverage:
@@ -161,7 +177,7 @@ if __name__ == '__main__':
                 backend = Backend.xcode
             break
     # Running on a developer machine? Be nice!
-    if not mesonlib.is_windows() and 'TRAVIS' not in os.environ:
+    if not mesonlib.is_windows() and not mesonlib.is_haiku() and 'TRAVIS' not in os.environ:
         os.nice(20)
     # Appveyor sets the `platform` environment variable which completely messes
     # up building with the vs2010 and vs2015 backends.
@@ -180,13 +196,6 @@ if __name__ == '__main__':
     # Run tests
     print(mlog.bold('Running unittests.').get_text(mlog.colorize_console))
     print()
-    units = ['InternalTests', 'AllPlatformTests', 'FailureTests']
-    if mesonlib.is_linux():
-        units += ['LinuxlikeTests']
-        if should_run_linux_cross_tests():
-            units += ['LinuxArmCrossCompileTests']
-    elif mesonlib.is_windows():
-        units += ['WindowsTests']
     # Can't pass arguments to unit tests, so set the backend to use in the environment
     env = os.environ.copy()
     env['MESON_UNIT_TEST_BACKEND'] = backend.name
@@ -198,8 +207,7 @@ if __name__ == '__main__':
                         'coverage.process_startup()\n')
             env['COVERAGE_PROCESS_START'] = '.coveragerc'
             env['PYTHONPATH'] = os.pathsep.join([td] + env.get('PYTHONPATH', []))
-
-        returncode += subprocess.call([sys.executable, 'run_unittests.py', '-v'] + units, env=env)
+        returncode += subprocess.call([sys.executable, 'run_unittests.py', '-v'], env=env)
         # Ubuntu packages do not have a binary without -6 suffix.
         if should_run_linux_cross_tests():
             print(mlog.bold('Running cross compilation tests.').get_text(mlog.colorize_console))

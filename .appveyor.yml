@@ -19,10 +19,12 @@ environment:
     - arch: x86
       compiler: msvc2015
       backend: ninja
+      BOOST_ROOT: C:\Libraries\Boost_1_59_0
 
     - arch: x86
       compiler: msvc2015
       backend: vs2015
+      BOOST_ROOT: C:\Libraries\Boost_1_59_0
 
     - arch: x64
       compiler: cygwin
@@ -36,11 +38,13 @@ environment:
       compiler: msvc2017
       backend: ninja
       APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+      BOOST_ROOT: C:\Libraries\Boost_1_64_0
 
     - arch: x64
       compiler: msvc2017
       backend: vs2017
       APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+      BOOST_ROOT: C:\Libraries\Boost_1_64_0
 
 platform:
   - x64
@@ -49,18 +53,26 @@ branches:
   only:
     - master
 
-skip_commits:
-  files:
-    - docs/**/*
+init:
+  - ps: |
+        If($Env:compiler -like 'msvc2010') {
+          Set-WinSystemLocale de-DE
+          Start-Sleep -s 5
+          Restart-Computer
+        }
 
 install:
   - cmd: set "ORIG_PATH=%PATH%"
-  # Boost 1.56.0: https://www.appveyor.com/docs/build-environment/#boost
-  #- cmd: set "BOOST_ROOT=C:\Libraries\boost"
+  # Use a Ninja with QuLogic's patch: https://github.com/ninja-build/ninja/issues/1219
+  - cmd: set "MESON_FIXED_NINJA=1"
+  - ps: (new-object net.webclient).DownloadFile('http://nirbheek.in/files/binaries/ninja/win32/ninja.exe', 'C:\projects\meson\ninja.exe')
   # Use the x86 python only when building for x86 for the cpython tests.
   # For all other archs (including, say, arm), use the x64 python.
-  - ps: (new-object net.webclient).DownloadFile('https://www.dropbox.com/s/bbzvepq85hv47x1/ninja.exe?dl=1', 'C:\projects\meson\ninja.exe')
   - cmd: if %arch%==x86 (set MESON_PYTHON_PATH=C:\python34) else (set MESON_PYTHON_PATH=C:\python34-x64)
+
+  # Set paths for BOOST dll files
+  - cmd: if %compiler%==msvc2015 ( if %arch%==x86 ( set "PATH=%PATH%;C:\Libraries\boost_1_59_0\lib32-msvc-14.0" ) else ( set "PATH=%PATH%;C:\Libraries\boost_1_59_0\lib64-msvc-14.0" ) )
+  - cmd: if %compiler%==msvc2017 ( if %arch%==x86 ( set "PATH=%PATH%;C:\Libraries\boost_1_64_0\lib32-msvc-14.1" ) else ( set "PATH=%PATH%;C:\Libraries\boost_1_64_0\lib64-msvc-14.1" ) )
 
   # Set paths and config for each build type.
   - cmd: if %compiler%==msvc2010 ( call "C:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\vcvarsall.bat" %arch% )
@@ -73,12 +85,23 @@ install:
   - cmd: if %compiler%==cygwin ( %WRAPPER% which %PYTHON% ) else ( where %PYTHON% )
 
   # Install additional packages needed for specific builds.
-  - ps: If($Env:compiler -eq 'msys2-mingw') {(new-object Net.WebClient).DownloadFile('https://bootstrap.pypa.io/get-pip.py', 'C:\projects\meson\get-pip.py')}
+  # This was originally downloaded from http://bootstrap.pypa.io/get-pip.py,
+  # but they have a broken certificate (on Windows) and an HSTS policy that
+  # forces usage of HTTPS, so we mirror our own copy.
+  - ps: If($Env:compiler -eq 'msys2-mingw') {(new-object Net.WebClient).DownloadFile('https://nirbheek.in/files/meson/get-pip.py', 'C:\projects\meson\get-pip.py')}
   - cmd: if %compiler%==msys2-mingw ( %PYTHON% "C:\projects\meson\get-pip.py" )
   - cmd: if %compiler%==cygwin ( call ci\appveyor-install.bat )
-
-  # Install additional packages needed for all builds.
-  - cmd: "%WRAPPER% %PYTHON% -m pip install codecov"
+  - ps: |
+        If($Env:compiler -like 'msvc*') {
+          (new-object net.webclient).DownloadFile(
+            "https://download.microsoft.com/download/D/B/B/DBB64BA1-7B51-43DB-8BF1-D1FB45EACF7A/msmpisdk.msi",
+            "C:\projects\msmpisdk.msi")
+          c:\windows\system32\msiexec.exe /i C:\projects\msmpisdk.msi /quiet
+          (new-object net.webclient).DownloadFile(
+            "https://download.microsoft.com/download/D/B/B/DBB64BA1-7B51-43DB-8BF1-D1FB45EACF7A/MSMpiSetup.exe",
+            "C:\projects\MSMpiSetup.exe")
+          c:\projects\MSMpiSetup.exe -unattend -full
+        }
 
 build_script:
   - cmd: echo No build step.
@@ -86,13 +109,7 @@ build_script:
 
 test_script:
   - cmd: echo Running tests for %arch% and %compiler% with the %backend% backend
-  - cmd: "%WRAPPER% %PYTHON% run_tests.py --cov --backend=%backend%"
-
-after_test:
-  - cmd: "%WRAPPER% %PYTHON% -m coverage combine"
-  # Generate XML report manually because codecov module doesn't know how to run it properly.
-  - cmd: "%WRAPPER% %PYTHON% -m coverage xml"
-  - cmd: "%WRAPPER% %PYTHON% -m codecov -X search pycov -f coverage.xml -n windows-%arch%-%compiler%-%backend%"
+  - cmd: "%WRAPPER% %PYTHON% run_tests.py --backend=%backend%"
 
 on_finish:
   - set "PATH=%ORIG_PATH%"

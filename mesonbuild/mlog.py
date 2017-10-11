@@ -22,16 +22,19 @@ colorize_console = platform.system().lower() != 'windows' and os.isatty(sys.stdo
     os.environ.get('TERM') != 'dumb'
 log_dir = None
 log_file = None
+log_fname = 'meson-log.txt'
 
 def initialize(logdir):
     global log_dir, log_file
     log_dir = logdir
-    log_file = open(os.path.join(logdir, 'meson-log.txt'), 'w', encoding='utf8')
+    log_file = open(os.path.join(logdir, log_fname), 'w', encoding='utf8')
 
 def shutdown():
     global log_file
     if log_file is not None:
-        log_file.close()
+        exception_around_goer = log_file
+        log_file = None
+        exception_around_goer.close()
 
 class AnsiDecorator:
     plain_code = "\033[0m"

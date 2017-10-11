@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib, os.path, re, tempfile
+import subprocess
 
 from ..linkers import StaticLinker
 from .. import coredata
@@ -53,6 +54,9 @@ clike_suffixes = ()
 for _l in clike_langs:
     clike_suffixes += lang_suffixes[_l]
 clike_suffixes += ('h', 'll', 's')
+
+# XXX: Use this in is_library()?
+soregex = re.compile(r'.*\.so(\.[0-9]+)?(\.[0-9]+)?(\.[0-9]+)?$')
 
 # All these are only for C-like languages; see `clike_langs` above.
 
@@ -207,11 +211,11 @@ base_options = {'b_pch': coredata.UserBooleanOption('b_pch', 'Use precompiled he
                 'b_lto': coredata.UserBooleanOption('b_lto', 'Use link time optimization', False),
                 'b_sanitize': coredata.UserComboOption('b_sanitize',
                                                        'Code sanitizer to use',
-                                                       ['none', 'address', 'thread', 'undefined', 'memory'],
+                                                       ['none', 'address', 'thread', 'undefined', 'memory', 'address,undefined'],
                                                        'none'),
                 'b_lundef': coredata.UserBooleanOption('b_lundef', 'Use -Wl,--no-undefined when linking', True),
                 'b_asneeded': coredata.UserBooleanOption('b_asneeded', 'Use -Wl,--as-needed when linking', True),
-                'b_pgo': coredata.UserComboOption('b_pgo', 'Use profile guide optimization',
+                'b_pgo': coredata.UserComboOption('b_pgo', 'Use profile guided optimization',
                                                   ['off', 'generate', 'use'],
                                                   'off'),
                 'b_coverage': coredata.UserBooleanOption('b_coverage',
@@ -227,6 +231,43 @@ base_options = {'b_pch': coredata.UserBooleanOption('b_pch', 'Use precompiled he
                                                           'Build static libraries as position independent',
                                                           True),
                 }
+
+gnulike_instruction_set_args = {'mmx': ['-mmmx'],
+                                'sse': ['-msse'],
+                                'sse2': ['-msse2'],
+                                'sse3': ['-msse3'],
+                                'ssse3': ['-mssse3'],
+                                'sse41': ['-msse4.1'],
+                                'sse42': ['-msse4.2'],
+                                'avx': ['-mavx'],
+                                'avx2': ['-mavx2'],
+                                'neon': ['-mfpu=neon'],
+                                }
+
+vs32_instruction_set_args = {'mmx': ['/arch:SSE'], # There does not seem to be a flag just for MMX
+                             'sse': ['/arch:SSE'],
+                             'sse2': ['/arch:SSE2'],
+                             'sse3': ['/arch:AVX'], # VS leaped from SSE2 directly to AVX.
+                             'sse41': ['/arch:AVX'],
+                             'sse42': ['/arch:AVX'],
+                             'avx': ['/arch:AVX'],
+                             'avx2': ['/arch:AVX2'],
+                             'neon': None,
+                             }
+
+# The 64 bit compiler defaults to /arch:avx.
+vs64_instruction_set_args = {'mmx': ['/arch:AVX'],
+                             'sse': ['/arch:AVX'],
+                             'sse2': ['/arch:AVX'],
+                             'sse3': ['/arch:AVX'],
+                             'ssse3': ['/arch:AVX'],
+                             'sse41': ['/arch:AVX'],
+                             'sse42': ['/arch:AVX'],
+                             'avx': ['/arch:AVX'],
+                             'avx2': ['/arch:AVX2'],
+                             'neon': None,
+                             }
+
 
 def sanitizer_compile_args(value):
     if value == 'none':
@@ -458,20 +499,24 @@ class CompilerArgs(list):
 
     def to_native(self):
         # Check if we need to add --start/end-group for circular dependencies
-        # between static libraries.
+        # between static libraries, and for recursively searching for symbols
+        # needed by static libraries that are provided by object files or
+        # shared libraries.
         if get_compiler_uses_gnuld(self.compiler):
-            group_started = False
+            global soregex
+            group_start = -1
             for each in self:
-                if not each.startswith('-l') and not each.endswith('.a'):
+                if not each.startswith('-l') and not each.endswith('.a') and \
+                   not soregex.match(each):
                     continue
                 i = self.index(each)
-                if not group_started:
+                if group_start < 0:
                     # First occurance of a library
-                    self.insert(i, '-Wl,--start-group')
-                    group_started = True
-            # Last occurance of a library
-            if group_started:
+                    group_start = i
+            if group_start >= 0:
+                # Last occurance of a library
                 self.insert(i + 1, '-Wl,--end-group')
+                self.insert(group_start, '-Wl,--start-group')
         return self.compiler.unix_args_to_native(self)
 
     def append_direct(self, arg):
@@ -549,6 +594,10 @@ class CompilerArgs(list):
         self.__iadd__(args)
 
 class Compiler:
+    # Libraries to ignore in find_library() since they are provided by the
+    # compiler or the C library. Currently only used for MSVC.
+    ignore_libs = ()
+
     def __init__(self, exelist, version):
         if isinstance(exelist, str):
             self.exelist = [exelist]
@@ -664,6 +713,13 @@ class Compiler:
             'Language {} does not support has_multi_arguments.'.format(
                 self.get_display_language()))
 
+    def get_supported_arguments(self, args, env):
+        supported_args = []
+        for arg in args:
+            if self.has_argument(arg, env):
+                supported_args.append(arg)
+        return supported_args
+
     def get_cross_extra_flags(self, environment, link):
         extra_flags = []
         if self.is_cross and environment:
@@ -755,24 +811,29 @@ class Compiler:
             return []
         raise EnvironmentException('Language %s does not support linking whole archives.' % self.get_display_language())
 
-    def build_unix_rpath_args(self, build_dir, from_dir, rpath_paths, install_rpath):
-        if not rpath_paths and not install_rpath:
+    # Compiler arguments needed to enable the given instruction set.
+    # May be [] meaning nothing needed or None meaning the given set
+    # is not supported.
+    def get_instruction_set_args(self, instruction_set):
+        return None
+
+    def build_unix_rpath_args(self, build_dir, from_dir, rpath_paths, build_rpath, install_rpath):
+        if not rpath_paths and not install_rpath and not build_rpath:
             return []
         # The rpaths we write must be relative, because otherwise
         # they have different length depending on the build
         # directory. This breaks reproducible builds.
         rel_rpaths = []
         for p in rpath_paths:
-            # p can be an empty string for build_dir (relative path), but
-            # os.path.relpath() below won't like that.
-            if p == '':
-                p = build_dir
             if p == from_dir:
                 relative = '' # relpath errors out in this case
             else:
-                relative = os.path.relpath(p, from_dir)
+                relative = os.path.relpath(os.path.join(build_dir, p), os.path.join(build_dir, from_dir))
             rel_rpaths.append(relative)
         paths = ':'.join([os.path.join('$ORIGIN', p) for p in rel_rpaths])
+        # Build_rpath is used as-is (it is usually absolute).
+        if build_rpath != '':
+            paths += ':' + build_rpath
         if len(paths) < len(install_rpath):
             padding = 'X' * (len(install_rpath) - len(paths))
             if not paths:
@@ -857,6 +918,35 @@ def get_largefile_args(compiler):
         # those features explicitly.
     return []
 
+# TODO: The result from calling compiler should be cached. So that calling this
+# function multiple times don't add latency.
+def gnulike_default_include_dirs(compiler, lang):
+    if lang == 'cpp':
+        lang = 'c++'
+    p = subprocess.Popen(
+        compiler + ['-x{}'.format(lang), '-E', '-v', '-'],
+        stdin=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE
+    )
+    stderr = p.stderr.read().decode('utf-8')
+    parse_state = 0
+    paths = []
+    for line in stderr.split('\n'):
+        if parse_state == 0:
+            if line == '#include "..." search starts here:':
+                parse_state = 1
+        elif parse_state == 1:
+            if line == '#include <...> search starts here:':
+                parse_state = 2
+            else:
+                paths.append(line[1:])
+        elif parse_state == 2:
+            if line == 'End of search list.':
+                break
+            else:
+                paths.append(line[1:])
+    return paths
 
 class GnuCompiler:
     # Functionality that is common to all GNU family compilers.
@@ -915,8 +1005,6 @@ class GnuCompiler:
         return get_gcc_soname_args(self.gcc_type, prefix, shlib_name, suffix, path, soversion, is_shared_module)
 
     def get_std_shared_lib_link_args(self):
-        if self.gcc_type == GCC_OSX:
-            return ['-bundle']
         return ['-shared']
 
     def get_link_whole_for(self, args):
@@ -936,6 +1024,13 @@ class GnuCompiler:
         if self.gcc_type in (GCC_CYGWIN, GCC_MINGW):
             return ['-mwindows']
         return []
+
+    def get_instruction_set_args(self, instruction_set):
+        return gnulike_instruction_set_args.get(instruction_set, None)
+
+    def get_default_include_dirs(self):
+        return gnulike_default_include_dirs(self.exelist, self.language)
+
 
 class ClangCompiler:
     def __init__(self, clang_type):
@@ -986,8 +1081,11 @@ class ClangCompiler:
         return get_gcc_soname_args(gcc_type, prefix, shlib_name, suffix, path, soversion, is_shared_module)
 
     def has_multi_arguments(self, args, env):
+        myargs = ['-Werror=unknown-warning-option', '-Werror=unused-command-line-argument']
+        if mesonlib.version_compare(self.version, '>=3.6.0'):
+            myargs.append('-Werror=ignored-optimization-argument')
         return super().has_multi_arguments(
-            ['-Werror=unknown-warning-option'] + args,
+            myargs + args,
             env)
 
     def has_function(self, funcname, prefix, env, extra_args=None, dependencies=None):
@@ -1013,6 +1111,12 @@ class ClangCompiler:
                 result += ['-Wl,-force_load', a]
             return result
         return ['-Wl,--whole-archive'] + args + ['-Wl,--no-whole-archive']
+
+    def get_instruction_set_args(self, instruction_set):
+        return gnulike_instruction_set_args.get(instruction_set, None)
+
+    def get_default_include_dirs(self):
+        return gnulike_default_include_dirs(self.exelist, self.language)
 
 
 # Tested on linux for ICC 14.0.3, 15.0.6, 16.0.4, 17.0.1
@@ -1064,3 +1168,6 @@ class IntelCompiler:
         # if self.icc_type == ICC_OSX:
         #     return ['-bundle']
         return ['-shared']
+
+    def get_default_include_dirs(self):
+        return gnulike_default_include_dirs(self.exelist, self.language)

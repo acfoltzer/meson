@@ -20,10 +20,11 @@ from .. import mlog
 from .. import compilers
 import json
 import subprocess
-from ..mesonlib import MesonException, get_meson_script
+from ..mesonlib import MesonException
 from ..mesonlib import get_compiler_for_source, classify_unity_sources
 from ..compilers import CompilerArgs
 from collections import OrderedDict
+import shlex
 
 class CleanTrees:
     '''
@@ -64,12 +65,12 @@ class ExecutableSerialisation:
         self.capture = capture
 
 class TestSerialisation:
-    def __init__(self, name, suite, fname, is_cross, exe_wrapper, is_parallel, cmd_args, env,
+    def __init__(self, name, suite, fname, is_cross_built, exe_wrapper, is_parallel, cmd_args, env,
                  should_fail, timeout, workdir, extra_paths):
         self.name = name
         self.suite = suite
         self.fname = fname
-        self.is_cross = is_cross
+        self.is_cross_built = is_cross_built
         self.exe_runner = exe_wrapper
         self.is_parallel = is_parallel
         self.cmd_args = cmd_args
@@ -140,7 +141,12 @@ class Backend:
             return os.path.join(self.get_target_dir(target), link_lib)
         elif isinstance(target, build.StaticLibrary):
             return os.path.join(self.get_target_dir(target), target.get_filename())
-        raise AssertionError('BUG: Tried to link to something that\'s not a library')
+        elif isinstance(target, build.Executable):
+            if target.import_filename:
+                return os.path.join(self.get_target_dir(target), target.get_import_filename())
+            else:
+                return None
+        raise AssertionError('BUG: Tried to link to {!r} which is not linkable'.format(target))
 
     def get_target_dir(self, target):
         if self.environment.coredata.get_builtin_option('layout') == 'mirror':
@@ -149,9 +155,18 @@ class Backend:
             dirname = 'meson-out'
         return dirname
 
+    def get_target_dir_relative_to(self, t, o):
+        '''Get a target dir relative to another target's directory'''
+        target_dir = os.path.join(self.environment.get_build_dir(), self.get_target_dir(t))
+        othert_dir = os.path.join(self.environment.get_build_dir(), self.get_target_dir(o))
+        return os.path.relpath(target_dir, othert_dir)
+
     def get_target_source_dir(self, target):
-        dirname = os.path.join(self.build_to_src, self.get_target_dir(target))
-        return dirname
+        # if target dir is empty, avoid extraneous trailing / from os.path.join()
+        target_dir = self.get_target_dir(target)
+        if target_dir:
+            return os.path.join(self.build_to_src, target_dir)
+        return self.build_to_src
 
     def get_target_private_dir(self, target):
         dirname = os.path.join(self.get_target_dir(target), target.get_basename() + target.type_suffix())
@@ -168,14 +183,15 @@ class Backend:
         Returns the full path of the generated source relative to the build root
         """
         # CustomTarget generators output to the build dir of the CustomTarget
-        if isinstance(gensrc, build.CustomTarget):
+        if isinstance(gensrc, (build.CustomTarget, build.CustomTargetIndex)):
             return os.path.join(self.get_target_dir(gensrc), src)
         # GeneratedList generators output to the private build directory of the
         # target that the GeneratedList is used in
         return os.path.join(self.get_target_private_dir(target), src)
 
-    def get_unity_source_filename(self, target, suffix):
-        return target.name + '-unity.' + suffix
+    def get_unity_source_file(self, target, suffix):
+        osrc = target.name + '-unity.' + suffix
+        return mesonlib.File.from_built_file(self.get_target_private_dir(target), osrc)
 
     def generate_unity_files(self, target, unity_src):
         abs_files = []
@@ -183,18 +199,15 @@ class Backend:
         compsrcs = classify_unity_sources(target.compilers.values(), unity_src)
 
         def init_language_file(suffix):
-            unity_src_name = self.get_unity_source_filename(target, suffix)
-            unity_src_subdir = self.get_target_private_dir_abs(target)
-            outfilename = os.path.join(unity_src_subdir,
-                                       unity_src_name)
-            outfileabs = os.path.join(self.environment.get_build_dir(),
-                                      outfilename)
+            unity_src = self.get_unity_source_file(target, suffix)
+            outfileabs = unity_src.absolute_path(self.environment.get_source_dir(),
+                                                 self.environment.get_build_dir())
             outfileabs_tmp = outfileabs + '.tmp'
             abs_files.append(outfileabs)
             outfileabs_tmp_dir = os.path.dirname(outfileabs_tmp)
             if not os.path.exists(outfileabs_tmp_dir):
                 os.makedirs(outfileabs_tmp_dir)
-            result.append(mesonlib.File(True, unity_src_subdir, unity_src_name))
+            result.append(unity_src)
             return open(outfileabs_tmp, 'w')
 
         # For each language, generate a unity source file and return the list
@@ -251,11 +264,11 @@ class Backend:
             else:
                 exe_cmd = [exe]
                 exe_needs_wrapper = False
-            is_cross = exe_needs_wrapper and \
+            is_cross_built = exe_needs_wrapper and \
                 self.environment.is_cross_build() and \
                 self.environment.cross_info.need_cross_compiler() and \
                 self.environment.cross_info.need_exe_wrapper()
-            if is_cross:
+            if is_cross_built:
                 exe_wrapper = self.environment.cross_info.config['binaries'].get('exe_wrapper', None)
             else:
                 exe_wrapper = None
@@ -264,7 +277,7 @@ class Backend:
             else:
                 extra_paths = []
             es = ExecutableSerialisation(basename, exe_cmd, cmd_args, env,
-                                         is_cross, exe_wrapper, workdir,
+                                         is_cross_built, exe_wrapper, workdir,
                                          extra_paths, capture)
             pickle.dump(es, f)
         return exe_data
@@ -294,6 +307,25 @@ class Backend:
             raise MesonException(m.format(target.name))
         return l
 
+    def rpaths_for_bundled_shared_libraries(self, target):
+        paths = []
+        for dep in target.external_deps:
+            if isinstance(dep, dependencies.ExternalLibrary):
+                la = dep.link_args
+                if len(la) == 1 and os.path.isabs(la[0]):
+                    # The only link argument is an absolute path to a library file.
+                    libpath = la[0]
+                    if libpath.startswith(('/usr/lib', '/lib')):
+                        # No point in adding system paths.
+                        continue
+                    if os.path.splitext(libpath)[1] not in ['.dll', '.lib', '.so']:
+                        continue
+                    absdir = os.path.split(libpath)[0]
+                    rel_to_src = absdir[len(self.environment.get_source_dir()) + 1:]
+                    assert(not os.path.isabs(rel_to_src))
+                    paths.append(os.path.join(self.build_to_src, rel_to_src))
+        return paths
+
     def determine_rpath_dirs(self, target):
         link_deps = target.get_all_link_deps()
         result = []
@@ -301,16 +333,41 @@ class Backend:
             prospective = self.get_target_dir(ld)
             if prospective not in result:
                 result.append(prospective)
+        for rp in self.rpaths_for_bundled_shared_libraries(target):
+            if rp not in result:
+                result += [rp]
         return result
 
     def object_filename_from_source(self, target, source, is_unity):
-        if isinstance(source, mesonlib.File):
-            source = source.fname
+        assert isinstance(source, mesonlib.File)
+        build_dir = self.environment.get_build_dir()
+        rel_src = source.rel_to_builddir(self.build_to_src)
         # foo.vala files compile down to foo.c and then foo.c.o, not foo.vala.o
-        if source.endswith(('.vala', '.gs')):
+        if rel_src.endswith(('.vala', '.gs')):
+            # See description in generate_vala_compile for this logic.
+            if source.is_built:
+                if os.path.isabs(rel_src):
+                    rel_src = rel_src[len(build_dir) + 1:]
+                rel_src = os.path.relpath(rel_src, self.get_target_private_dir(target))
+            else:
+                rel_src = os.path.basename(rel_src)
             if is_unity:
-                return source[:-5] + '.c.' + self.environment.get_object_suffix()
-            source = os.path.join(self.get_target_private_dir(target), source[:-5] + '.c')
+                return 'meson-generated_' + rel_src[:-5] + '.c.' + self.environment.get_object_suffix()
+            # A meson- prefixed directory is reserved; hopefully no-one creates a file name with such a weird prefix.
+            source = 'meson-generated_' + rel_src[:-5] + '.c'
+        elif source.is_built:
+            if os.path.isabs(rel_src):
+                rel_src = rel_src[len(build_dir) + 1:]
+            targetdir = self.get_target_private_dir(target)
+            # A meson- prefixed directory is reserved; hopefully no-one creates a file name with such a weird prefix.
+            source = 'meson-generated_' + os.path.relpath(rel_src, targetdir)
+        else:
+            if os.path.isabs(rel_src):
+                # Not from the source directory; hopefully this doesn't conflict with user's source files.
+                source = os.path.basename(rel_src)
+            else:
+                source = os.path.relpath(os.path.join(build_dir, rel_src),
+                                         os.path.join(self.environment.get_source_dir(), target.get_subdir()))
         return source.replace('/', '_').replace('\\', '_') + '.' + self.environment.get_object_suffix()
 
     def determine_ext_objs(self, target, extobj, proj_dir_to_build_root):
@@ -324,9 +381,8 @@ class Backend:
                                            extobj.srclist[0])
             # There is a potential conflict here, but it is unlikely that
             # anyone both enables unity builds and has a file called foo-unity.cpp.
-            osrc = self.get_unity_source_filename(extobj.target,
-                                                  comp.get_default_suffix())
-            osrc = os.path.join(self.get_target_private_dir(extobj.target), osrc)
+            osrc = self.get_unity_source_file(extobj.target,
+                                              comp.get_default_suffix())
             objname = self.object_filename_from_source(extobj.target, osrc, True)
             objname = objname.replace('/', '_').replace('\\', '_')
             objpath = os.path.join(proj_dir_to_build_root, targetdir, objname)
@@ -463,12 +519,13 @@ class Backend:
     def build_target_link_arguments(self, compiler, deps):
         args = []
         for d in deps:
-            if not isinstance(d, (build.StaticLibrary, build.SharedLibrary)):
+            if not (d.is_linkable_target()):
                 raise RuntimeError('Tried to link with a non-library target "%s".' % d.get_basename())
+            d_arg = self.get_target_filename_for_linking(d)
+            if not d_arg:
+                continue
             if isinstance(compiler, (compilers.LLVMDCompiler, compilers.DmdDCompiler)):
-                d_arg = '-L' + self.get_target_filename_for_linking(d)
-            else:
-                d_arg = self.get_target_filename_for_linking(d)
+                d_arg = '-L' + d_arg
             args.append(d_arg)
         return args
 
@@ -487,6 +544,8 @@ class Backend:
             dirseg = os.path.join(self.environment.get_build_dir(), self.get_target_dir(ld))
             if dirseg not in result:
                 result.append(dirseg)
+        for deppath in self.rpaths_for_bundled_shared_libraries(target):
+            result.append(os.path.normpath(os.path.join(self.environment.get_build_dir(), deppath)))
         return result
 
     def write_benchmark_file(self, datafile):
@@ -506,6 +565,12 @@ class Backend:
             is_cross = self.environment.is_cross_build() and \
                 self.environment.cross_info.need_cross_compiler() and \
                 self.environment.cross_info.need_exe_wrapper()
+            if isinstance(exe, build.BuildTarget):
+                is_cross = is_cross and exe.is_cross
+            if isinstance(exe, dependencies.ExternalProgram):
+                # E.g. an external verificator or simulator program run on a generated executable.
+                # Can always be run.
+                is_cross = False
             if is_cross:
                 exe_wrapper = self.environment.cross_info.config['binaries'].get('exe_wrapper', None)
             else:
@@ -763,7 +828,8 @@ class Backend:
     def run_postconf_scripts(self):
         env = {'MESON_SOURCE_ROOT': self.environment.get_source_dir(),
                'MESON_BUILD_ROOT': self.environment.get_build_dir(),
-               'MESONINTROSPECT': get_meson_script(self.environment, 'mesonintrospect')}
+               'MESONINTROSPECT': ' '.join([shlex.quote(x) for x in self.environment.get_build_command() + ['introspect']]),
+               }
         child_env = os.environ.copy()
         child_env.update(env)
 

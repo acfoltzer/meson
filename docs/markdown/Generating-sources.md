@@ -24,14 +24,14 @@ Custom targets can take zero or more input files and use them to generate one or
 
 ```meson
 gen_src = custom_target('gen-output',
-                        input : ['somefile1.c', 'file2.c']
-                        output : ['out.c', 'out.h']
+                        input : ['somefile1.c', 'file2.c'],
+                        output : ['out.c', 'out.h'],
                         command : [mycomp, '@INPUT@',
                                    '--c-out', '@OUTPUT0@',
                                    '--h-out', '@OUTPUT1@'])
 ```
 
-The `@INPUT@` there will be transformed to `'out.c' 'out.h'`. Just like the output, you can also refer to each input file individually by index. 
+The `@INPUT@` there will be transformed to `'somefile1.c' 'file2.c'`. Just like the output, you can also refer to each input file individually by index. 
 
 Then you just put that in your program and you're done.
 
@@ -68,7 +68,7 @@ Generators can also generate multiple output files with unknown names:
 ```meson
 gen2 = generator(someprog,
                  outputs : ['@BASENAME@.c', '@BASENAME@.h'],
-                 arguments : ['--out_dir=@BUILD_DIR@', '@INPUT@']
+                 arguments : ['--out_dir=@BUILD_DIR@', '@INPUT@'])
 ```
 
 In this case you can not use the plain `@OUTPUT@` variable, as it would be ambiguous. This program only needs to know the output directory, it will generate the file names by itself.

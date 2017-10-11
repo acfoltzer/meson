@@ -120,6 +120,9 @@ end program prog
     def get_include_args(self, path, is_system):
         return ['-I' + path]
 
+    def get_module_incdir_args(self):
+        return ('-I', )
+
     def get_module_outdir_args(self, path):
         return ['-J' + path]
 
@@ -132,8 +135,8 @@ end program prog
     def get_std_exe_link_args(self):
         return []
 
-    def build_rpath_args(self, build_dir, from_dir, rpath_paths, install_rpath):
-        return self.build_unix_rpath_args(build_dir, from_dir, rpath_paths, install_rpath)
+    def build_rpath_args(self, build_dir, from_dir, rpath_paths, build_rpath, install_rpath):
+        return self.build_unix_rpath_args(build_dir, from_dir, rpath_paths, build_rpath, install_rpath)
 
     def module_name_to_filename(self, module_name):
         return module_name.lower() + '.mod'
@@ -161,6 +164,12 @@ class GnuFortranCompiler(FortranCompiler):
 
     def get_always_args(self):
         return ['-pipe']
+
+    def get_coverage_args(self):
+        return ['--coverage']
+
+    def get_coverage_link_args(self):
+        return ['--coverage']
 
     def gen_import_library_args(self, implibname):
         """
@@ -209,6 +218,9 @@ class SunFortranCompiler(FortranCompiler):
     def get_warn_args(self, level):
         return []
 
+    def get_module_incdir_args(self):
+        return ('-M', )
+
     def get_module_outdir_args(self, path):
         return ['-moddir=' + path]
 
@@ -250,6 +262,9 @@ class PGIFortranCompiler(FortranCompiler):
     def __init__(self, exelist, version, is_cross, exe_wrapper=None):
         super().__init__(exelist, version, is_cross, exe_wrapper=None)
         self.id = 'pgi'
+
+    def get_module_incdir_args(self):
+        return ('-module', )
 
     def get_module_outdir_args(self, path):
         return ['-module', path]

@@ -23,11 +23,12 @@ from enum import Enum
 
 from .. import mlog
 from .. import mesonlib
-from ..mesonlib import MesonException, Popen_safe, flatten, version_compare_many
+from ..mesonlib import MesonException, Popen_safe, version_compare_many, listify
 
 
-# This must be defined in this file to avoid cyclical references.
+# These must be defined in this file to avoid cyclical references.
 packages = {}
+_packages_accept_language = set()
 
 
 class DependencyException(MesonException):
@@ -43,6 +44,10 @@ class DependencyMethods(Enum):
     SYSTEM = 'system'
     # Detect using sdl2-config
     SDLCONFIG = 'sdlconfig'
+    # Detect using pcap-config
+    PCAPCONFIG = 'pcap-config'
+    # Detect using cups-config
+    CUPSCONFIG = 'cups-config'
     # This is only supported on OSX - search the frameworks directory by name.
     EXTRAFRAMEWORK = 'extraframework'
     # Detect using the sysconfig module.
@@ -369,10 +374,7 @@ class ExternalProgram:
     def __init__(self, name, command=None, silent=False, search_dir=None):
         self.name = name
         if command is not None:
-            if not isinstance(command, list):
-                self.command = [command]
-            else:
-                self.command = command
+            self.command = listify(command)
         else:
             self.command = self._search(name, search_dir)
         if not silent:
@@ -551,7 +553,7 @@ class ExtraFrameworkDependency(ExternalDependency):
     def detect(self, name, path):
         lname = name.lower()
         if path is None:
-            paths = ['/Library/Frameworks']
+            paths = ['/System/Library/Frameworks', '/Library/Frameworks']
         else:
             paths = [path]
         for p in paths:
@@ -584,7 +586,7 @@ class ExtraFrameworkDependency(ExternalDependency):
 
 def get_dep_identifier(name, kwargs, want_cross):
     # Need immutable objects since the identifier will be used as a dict key
-    version_reqs = flatten(kwargs.get('version', []))
+    version_reqs = listify(kwargs.get('version', []))
     if isinstance(version_reqs, list):
         version_reqs = frozenset(version_reqs)
     identifier = (name, version_reqs, want_cross)
@@ -597,7 +599,7 @@ def get_dep_identifier(name, kwargs, want_cross):
             continue
         # All keyword arguments are strings, ints, or lists (or lists of lists)
         if isinstance(value, list):
-            value = frozenset(flatten(value))
+            value = frozenset(listify(value))
         identifier += (key, value)
     return identifier
 
@@ -610,10 +612,15 @@ def find_external_dependency(name, env, kwargs):
         raise DependencyException('Keyword "method" must be a string.')
     lname = name.lower()
     if lname in packages:
+        if lname not in _packages_accept_language and 'language' in kwargs:
+            raise DependencyException('%s dependency does not accept "language" keyword argument' % (lname, ))
         dep = packages[lname](env, kwargs)
         if required and not dep.found():
             raise DependencyException('Dependency "%s" not found' % name)
         return dep
+    if 'language' in kwargs:
+        # Remove check when PkgConfigDependency supports language.
+        raise DependencyException('%s dependency does not accept "language" keyword argument' % (lname, ))
     pkg_exc = None
     pkgdep = None
     try:

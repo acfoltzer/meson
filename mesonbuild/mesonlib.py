@@ -14,6 +14,7 @@
 
 """A library of random helper functionality."""
 
+import sys
 import stat
 import time
 import platform, subprocess, operator, os, shutil, re
@@ -182,15 +183,6 @@ class File:
     def relative_name(self):
         return os.path.join(self.subdir, self.fname)
 
-def get_meson_script(env, script):
-    '''
-    Given the path of `meson.py`/`meson`, get the path of a meson script such
-    as `mesonintrospect` or `mesontest`.
-    '''
-    meson_py = env.get_build_command()
-    (base, ext) = os.path.splitext(meson_py)
-    return os.path.join(os.path.dirname(base), script + ext)
-
 def get_compiler_for_source(compilers, src):
     for comp in compilers:
         if comp.can_compile(src):
@@ -207,22 +199,14 @@ def classify_unity_sources(compilers, sources):
             compsrclist[comp].append(src)
     return compsrclist
 
-def flatten(item):
-    if not isinstance(item, list):
-        return [item]
-    result = []
-    for i in item:
-        if isinstance(i, list):
-            result += flatten(i)
-        else:
-            result.append(i)
-    return result
-
 def is_osx():
     return platform.system().lower() == 'darwin'
 
 def is_linux():
     return platform.system().lower() == 'linux'
+
+def is_haiku():
+    return platform.system().lower() == 'haiku'
 
 def is_windows():
     platname = platform.system().lower()
@@ -264,7 +248,7 @@ def detect_vcs(source_dir):
 
 def grab_leading_numbers(vstr, strict=False):
     result = []
-    for x in vstr.split('.'):
+    for x in vstr.rstrip('.').split('.'):
         try:
             result.append(int(x))
         except ValueError as e:
@@ -375,6 +359,7 @@ def get_library_dirs():
 
 def do_replacement(regex, line, confdata):
     match = re.search(regex, line)
+    missing_variables = set()
     while match:
         varname = match.group(1)
         if varname in confdata:
@@ -386,10 +371,11 @@ def do_replacement(regex, line, confdata):
             else:
                 raise RuntimeError('Tried to replace a variable with something other than a string or int.')
         else:
+            missing_variables.add(varname)
             var = ''
         line = line.replace('@' + varname + '@', var)
         match = re.search(regex, line)
-    return line
+    return line, missing_variables
 
 def do_mesondefine(line, confdata):
     arr = line.split()
@@ -423,17 +409,20 @@ def do_conf_file(src, dst, confdata):
     # Also allow escaping '@' with '\@'
     regex = re.compile(r'[^\\]?@([-a-zA-Z0-9_]+)@')
     result = []
+    missing_variables = set()
     for line in data:
         if line.startswith('#mesondefine'):
             line = do_mesondefine(line, confdata)
         else:
-            line = do_replacement(regex, line, confdata)
+            line, missing = do_replacement(regex, line, confdata)
+            missing_variables.update(missing)
         result.append(line)
     dst_tmp = dst + '~'
     with open(dst_tmp, 'w', encoding='utf-8') as f:
         f.writelines(result)
     shutil.copymode(src, dst_tmp)
     replace_if_different(dst, dst_tmp)
+    return missing_variables
 
 def dump_conf_header(ofilename, cdata):
     with open(ofilename, 'w', encoding='utf-8') as ofile:
@@ -474,6 +463,47 @@ def replace_if_different(dst, dst_tmp):
     else:
         os.unlink(dst_tmp)
 
+def listify(item, flatten=True, unholder=False):
+    '''
+    Returns a list with all args embedded in a list if they are not a list.
+    This function preserves order.
+    @flatten: Convert lists of lists to a flat list
+    @unholder: Replace each item with the object it holds, if required
+
+    Note: unholding only works recursively when flattening
+    '''
+    if not isinstance(item, list):
+        if unholder and hasattr(item, 'held_object'):
+            item = item.held_object
+        return [item]
+    result = []
+    for i in item:
+        if unholder and hasattr(i, 'held_object'):
+            i = i.held_object
+        if flatten and isinstance(i, list):
+            result += listify(i, flatten=True, unholder=unholder)
+        else:
+            result.append(i)
+    return result
+
+
+def extract_as_list(dict_object, *keys, pop=False, **kwargs):
+    '''
+    Extracts all values from given dict_object and listifies them.
+    '''
+    result = []
+    fetch = dict_object.get
+    if pop:
+        fetch = dict_object.pop
+    # If there's only one key, we don't return a list with one element
+    if len(keys) == 1:
+        return listify(fetch(keys[0], []), **kwargs)
+    # Return a list of values corresponding to *keys
+    for key in keys:
+        result.append(listify(fetch(key, []), **kwargs))
+    return result
+
+
 def typeslistify(item, types):
     '''
     Ensure that type(@item) is one of @types or a
@@ -510,11 +540,32 @@ def expand_arguments(args):
     return expended_args
 
 def Popen_safe(args, write=None, stderr=subprocess.PIPE, **kwargs):
+    if sys.version_info < (3, 6) or not sys.stdout.encoding:
+        return Popen_safe_legacy(args, write=write, stderr=stderr, **kwargs)
     p = subprocess.Popen(args, universal_newlines=True,
                          close_fds=False,
                          stdout=subprocess.PIPE,
                          stderr=stderr, **kwargs)
     o, e = p.communicate(write)
+    return p, o, e
+
+def Popen_safe_legacy(args, write=None, stderr=subprocess.PIPE, **kwargs):
+    p = subprocess.Popen(args, universal_newlines=False,
+                         stdout=subprocess.PIPE,
+                         stderr=stderr, **kwargs)
+    if write is not None:
+        write = write.encode('utf-8')
+    o, e = p.communicate(write)
+    if o is not None:
+        if sys.stdout.encoding:
+            o = o.decode(encoding=sys.stdout.encoding, errors='replace').replace('\r\n', '\n')
+        else:
+            o = o.decode(errors='replace').replace('\r\n', '\n')
+    if e is not None:
+        if sys.stderr.encoding:
+            e = e.decode(encoding=sys.stderr.encoding, errors='replace').replace('\r\n', '\n')
+        else:
+            e = e.decode(errors='replace').replace('\r\n', '\n')
     return p, o, e
 
 def commonpath(paths):
@@ -708,14 +759,6 @@ def windows_proof_rmtree(f):
             time.sleep(d)
     # Try one last time and throw if it fails.
     shutil.rmtree(f)
-
-def unholder_array(entries):
-    result = []
-    for e in entries:
-        if hasattr(e, 'held_object'):
-            e = e.held_object
-        result.append(e)
-    return result
 
 class OrderedSet(collections.MutableSet):
     """A set that preserves the order in which items are added, by first

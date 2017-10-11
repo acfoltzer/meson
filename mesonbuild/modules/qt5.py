@@ -15,12 +15,13 @@
 import os
 from .. import mlog
 from .. import build
-from ..mesonlib import MesonException, Popen_safe
+from ..mesonlib import MesonException, Popen_safe, extract_as_list
 from ..dependencies import Qt5Dependency
 from . import ExtensionModule
 import xml.etree.ElementTree as ET
 from . import ModuleReturnValue
-from . import permittedKwargs
+from ..interpreterbase import permittedKwargs
+from . import get_include_args
 
 class Qt5Module(ExtensionModule):
     tools_detected = False
@@ -103,23 +104,10 @@ class Qt5Module(ExtensionModule):
         except Exception:
             return []
 
-    @permittedKwargs({'moc_headers', 'moc_sources', 'ui_files', 'qresources', 'method'})
+    @permittedKwargs({'moc_headers', 'moc_sources', 'include_directories', 'ui_files', 'qresources', 'method'})
     def preprocess(self, state, args, kwargs):
-        rcc_files = kwargs.pop('qresources', [])
-        if not isinstance(rcc_files, list):
-            rcc_files = [rcc_files]
-        ui_files = kwargs.pop('ui_files', [])
-        if not isinstance(ui_files, list):
-            ui_files = [ui_files]
-        moc_headers = kwargs.pop('moc_headers', [])
-        if not isinstance(moc_headers, list):
-            moc_headers = [moc_headers]
-        moc_sources = kwargs.pop('moc_sources', [])
-        if not isinstance(moc_sources, list):
-            moc_sources = [moc_sources]
-        sources = kwargs.pop('sources', [])
-        if not isinstance(sources, list):
-            sources = [sources]
+        rcc_files, ui_files, moc_headers, moc_sources, sources, include_directories \
+            = extract_as_list(kwargs, 'qresources', 'ui_files', 'moc_headers', 'moc_sources', 'sources', 'include_directories', pop = True)
         sources += args[1:]
         method = kwargs.get('method', 'auto')
         self._detect_tools(state.environment, method)
@@ -152,9 +140,10 @@ class Qt5Module(ExtensionModule):
             ui_gen = build.Generator([self.uic], ui_kwargs)
             ui_output = ui_gen.process_files('Qt5 ui', ui_files, state)
             sources.append(ui_output)
+        inc = get_include_args(include_dirs=include_directories)
         if len(moc_headers) > 0:
             moc_kwargs = {'output': 'moc_@BASENAME@.cpp',
-                          'arguments': ['@INPUT@', '-o', '@OUTPUT@']}
+                          'arguments': inc + ['@INPUT@', '-o', '@OUTPUT@']}
             moc_gen = build.Generator([self.moc], moc_kwargs)
             moc_output = moc_gen.process_files('Qt5 moc header', moc_headers, state)
             sources.append(moc_output)

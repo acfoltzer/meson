@@ -16,7 +16,7 @@ import subprocess, os.path, tempfile
 
 from .. import mlog
 from .. import coredata
-from ..mesonlib import EnvironmentException, version_compare, Popen_safe
+from ..mesonlib import EnvironmentException, version_compare, Popen_safe, listify
 
 from .compilers import (
     GCC_MINGW,
@@ -25,6 +25,8 @@ from .compilers import (
     msvc_buildtype_args,
     msvc_buildtype_linker_args,
     msvc_winlibs,
+    vs32_instruction_set_args,
+    vs64_instruction_set_args,
     ClangCompiler,
     Compiler,
     CompilerArgs,
@@ -85,8 +87,8 @@ class CCompiler(Compiler):
         return None, fname
 
     # The default behavior is this, override in MSVC
-    def build_rpath_args(self, build_dir, from_dir, rpath_paths, install_rpath):
-        return self.build_unix_rpath_args(build_dir, from_dir, rpath_paths, install_rpath)
+    def build_rpath_args(self, build_dir, from_dir, rpath_paths, build_rpath, install_rpath):
+        return self.build_unix_rpath_args(build_dir, from_dir, rpath_paths, build_rpath, install_rpath)
 
     def get_dependency_gen_args(self, outtarget, outfile):
         return ['-MMD', '-MQ', outtarget, '-MF', outfile]
@@ -169,6 +171,9 @@ class CCompiler(Compiler):
 
     def get_linker_search_args(self, dirname):
         return ['-L' + dirname]
+
+    def get_default_include_dirs(self):
+        return []
 
     def gen_import_library_args(self, implibname):
         """
@@ -271,9 +276,13 @@ class CCompiler(Compiler):
         for d in dependencies:
             # Add compile flags needed by dependencies
             args += d.get_compile_args()
+            if d.need_threads():
+                args += self.thread_flags()
             if mode == 'link':
                 # Add link flags needed to find dependencies
                 args += d.get_link_args()
+                if d.need_threads():
+                    args += self.thread_link_flags()
         # Select a CRT if needed since we're linking
         if mode == 'link':
             args += self.get_linker_debug_crt_args()
@@ -476,6 +485,34 @@ class CCompiler(Compiler):
         # minus the extra newline at the end
         return p.stdo.split(delim + '\n')[-1][:-1]
 
+    def get_return_value(self, fname, rtype, prefix, env, extra_args, dependencies):
+        if rtype == 'string':
+            fmt = '%s'
+            cast = '(char*)'
+        elif rtype == 'int':
+            fmt = '%lli'
+            cast = '(long long int)'
+        else:
+            raise AssertionError('BUG: Unknown return type {!r}'.format(rtype))
+        fargs = {'prefix': prefix, 'f': fname, 'cast': cast, 'fmt': fmt}
+        code = '''{prefix}
+        #include <stdio.h>
+        int main(int argc, char *argv[]) {{
+            printf ("{fmt}", {cast} {f}());
+        }}'''.format(**fargs)
+        res = self.run(code, env, extra_args, dependencies)
+        if not res.compiled:
+            m = 'Could not get return value of {}()'
+            raise EnvironmentException(m.format(fname))
+        if rtype == 'string':
+            return res.stdout
+        elif rtype == 'int':
+            try:
+                return int(res.stdout.strip())
+            except:
+                m = 'Return value of {}() is not an int'
+                raise EnvironmentException(m.format(fname))
+
     @staticmethod
     def _no_prototype_templ():
         """
@@ -674,11 +711,11 @@ class CCompiler(Compiler):
         raise RuntimeError('BUG: {!r} check failed unexpectedly'.format(n))
 
     def find_library(self, libname, env, extra_dirs):
+        # These libraries are either built-in or invalid
+        if libname in self.ignore_libs:
+            return []
         # First try if we can just add the library as -l.
-        code = '''int main(int argc, char **argv) {
-    return 0;
-}
-        '''
+        code = 'int main(int argc, char **argv) { return 0; }'
         if extra_dirs and isinstance(extra_dirs, str):
             extra_dirs = [extra_dirs]
         # Gcc + co seem to prefer builtin lib dirs to -L dirs.
@@ -771,6 +808,9 @@ class GnuCCompiler(GnuCompiler, CCompiler):
     def get_std_shared_lib_link_args(self):
         return ['-shared']
 
+    def get_pch_use_args(self, pch_dir, header):
+        return ['-fpch-preprocess', '-include', os.path.split(header)[-1]]
+
 
 class IntelCCompiler(IntelCompiler, CCompiler):
     def __init__(self, exelist, version, icc_type, is_cross, exe_wrapper=None):
@@ -809,8 +849,9 @@ class IntelCCompiler(IntelCompiler, CCompiler):
 class VisualStudioCCompiler(CCompiler):
     std_warn_args = ['/W3']
     std_opt_args = ['/O2']
+    ignore_libs = ('m', 'c', 'pthread')
 
-    def __init__(self, exelist, version, is_cross, exe_wrap):
+    def __init__(self, exelist, version, is_cross, exe_wrap, is_64):
         CCompiler.__init__(self, exelist, version, is_cross, exe_wrap)
         self.id = 'msvc'
         # /showIncludes is needed for build dependency tracking in Ninja
@@ -820,6 +861,7 @@ class VisualStudioCCompiler(CCompiler):
                           '2': ['/W3'],
                           '3': ['/W4']}
         self.base_options = ['b_pch'] # FIXME add lto, pgo and the like
+        self.is_64 = is_64
 
     # Override CCompiler.get_always_args
     def get_always_args(self):
@@ -885,6 +927,9 @@ class VisualStudioCCompiler(CCompiler):
     def get_linker_search_args(self, dirname):
         return ['/LIBPATH:' + dirname]
 
+    def get_gui_app_args(self):
+        return ['/SUBSYSTEM:WINDOWS']
+
     def get_pic_args(self):
         return [] # PIC is handled by the loader on Windows
 
@@ -906,7 +951,7 @@ class VisualStudioCCompiler(CCompiler):
         "The name of the outputted import library"
         return ['/IMPLIB:' + implibname]
 
-    def build_rpath_args(self, build_dir, from_dir, rpath_paths, install_rpath):
+    def build_rpath_args(self, build_dir, from_dir, rpath_paths, build_rpath, install_rpath):
         return []
 
     # FIXME, no idea what these should be.
@@ -938,7 +983,7 @@ class VisualStudioCCompiler(CCompiler):
             # Translate GNU-style -lfoo library name to the import library
             elif i.startswith('-l'):
                 name = i[2:]
-                if name in ('m', 'c', 'pthread'):
+                if name in cls.ignore_libs:
                     # With MSVC, these are provided by the C runtime which is
                     # linked in by default
                     continue
@@ -1002,6 +1047,46 @@ class VisualStudioCCompiler(CCompiler):
 
     def get_link_whole_for(self, args):
         # Only since VS2015
-        if not isinstance(args, list):
-            args = [args]
+        args = listify(args)
         return ['/WHOLEARCHIVE:' + x for x in args]
+
+    def get_instruction_set_args(self, instruction_set):
+        if self.is_64:
+            return vs64_instruction_set_args.get(instruction_set, None)
+        if self.version.split('.')[0] == '16' and instruction_set == 'avx':
+            # VS documentation says that this exists and should work, but
+            # it does not. The headers do not contain AVX intrinsics
+            # and the can not be called.
+            return None
+        return vs32_instruction_set_args.get(instruction_set, None)
+
+    def get_toolset_version(self):
+        # See boost/config/compiler/visualc.cpp for up to date mapping
+        try:
+            version = int(''.join(self.version.split('.')[0:2]))
+        except:
+            return None
+        if version < 1310:
+            return '7.0'
+        elif version < 1400:
+            return '7.1' # (Visual Studio 2003)
+        elif version < 1500:
+            return '8.0' # (Visual Studio 2005)
+        elif version < 1600:
+            return '9.0' # (Visual Studio 2008)
+        elif version < 1700:
+            return '10.0' # (Visual Studio 2010)
+        elif version < 1800:
+            return '11.0' # (Visual Studio 2012)
+        elif version < 1900:
+            return '12.0' # (Visual Studio 2013)
+        elif version < 1910:
+            return '14.0' # (Visual Studio 2015)
+        elif version < 1920:
+            return '14.1' # (Visual Studio 2017)
+        return None
+
+    def get_default_include_dirs(self):
+        if 'INCLUDE' not in os.environ:
+            return []
+        return os.environ['INCLUDE'].split(os.pathsep)

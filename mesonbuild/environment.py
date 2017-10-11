@@ -19,6 +19,7 @@ from .linkers import ArLinker, VisualStudioLinker
 from . import mesonlib
 from .mesonlib import EnvironmentException, Popen_safe
 from . import mlog
+import sys
 
 from . import compilers
 from .compilers import (
@@ -89,16 +90,19 @@ def find_coverage_tools():
         genhtml_exe = None
     return gcovr_exe, lcov_exe, genhtml_exe
 
-def detect_ninja(version='1.5'):
+def detect_ninja(version='1.5', log=False):
     for n in ['ninja', 'ninja-build']:
         try:
             p, found = Popen_safe([n, '--version'])[0:2]
         except (FileNotFoundError, PermissionError):
             # Doesn't exist in PATH or isn't executable
             continue
+        found = found.strip()
         # Perhaps we should add a way for the caller to know the failure mode
         # (not found or too old)
         if p.returncode == 0 and mesonlib.version_compare(found, '>=' + version):
+            if log:
+                mlog.log('Found ninja-{} at {}'.format(found, shlex.quote(shutil.which(n))))
             return n
 
 def detect_native_windows_arch():
@@ -309,8 +313,8 @@ class Environment:
             self.default_c = ['cl', 'cc', 'gcc', 'clang']
             self.default_cpp = ['cl', 'c++', 'g++', 'clang++']
         else:
-            self.default_c = ['cc']
-            self.default_cpp = ['c++']
+            self.default_c = ['cc', 'gcc', 'clang']
+            self.default_cpp = ['c++', 'g++', 'clang++']
         self.default_objc = ['cc']
         self.default_objcpp = ['c++']
         self.default_fortran = ['gfortran', 'g95', 'f95', 'f90', 'f77', 'ifort']
@@ -349,6 +353,7 @@ class Environment:
         cdf = os.path.join(self.get_build_dir(), Environment.coredata_file)
         coredata.save(self.coredata, cdf)
         os.utime(cdf, times=(mtime, mtime))
+        return cdf
 
     def get_script_dir(self):
         import mesonbuild.scripts
@@ -360,8 +365,15 @@ class Environment:
     def get_coredata(self):
         return self.coredata
 
-    def get_build_command(self):
-        return self.meson_script_launcher
+    def get_build_command(self, unbuffered=False):
+        # If running an executable created with cx_freeze,
+        # Python might not be installed so don't prefix
+        # the command with it.
+        if sys.executable.endswith('meson.exe'):
+            return [sys.executable]
+        if unbuffered:
+            [sys.executable, '-u', self.meson_script_launcher]
+        return [sys.executable, self.meson_script_launcher]
 
     def is_header(self, fname):
         return is_header(fname)
@@ -410,9 +422,9 @@ class Environment:
         # Arguments to output compiler pre-processor defines to stdout
         # gcc, g++, and gfortran all support these arguments
         args = compiler + ['-E', '-dM', '-']
-        p, output = Popen_safe(args, write='', stdin=subprocess.PIPE)[0:2]
+        p, output, error = Popen_safe(args, write='', stdin=subprocess.PIPE)
         if p.returncode != 0:
-            raise EnvironmentException('Unable to detect GNU compiler type:\n' + output)
+            raise EnvironmentException('Unable to detect GNU compiler type:\n' + output + error)
         # Parse several lines of the type:
         # `#define ___SOME_DEF some_value`
         # and extract `___SOME_DEF`
@@ -502,6 +514,24 @@ class Environment:
             if isinstance(compiler, str):
                 compiler = [compiler]
             if 'cl' in compiler or 'cl.exe' in compiler:
+                # Watcom C provides it's own cl.exe clone that mimics an older
+                # version of Microsoft's compiler. Since Watcom's cl.exe is
+                # just a wrapper, we skip using it if we detect its presence
+                # so as not to confuse Meson when configuring for MSVC.
+                #
+                # Additionally the help text of Watcom's cl.exe is paged, and
+                # the binary will not exit without human intervention. In
+                # practice, Meson will block waiting for Watcom's cl.exe to
+                # exit, which requires user input and thus will never exit.
+                if 'WATCOM' in os.environ:
+                    def sanitize(p):
+                        return os.path.normcase(os.path.abspath(p))
+
+                    watcom_cls = [sanitize(os.path.join(os.environ['WATCOM'], 'BINNT', 'cl')),
+                                  sanitize(os.path.join(os.environ['WATCOM'], 'BINNT', 'cl.exe'))]
+                    found_cl = sanitize(shutil.which('cl'))
+                    if found_cl in watcom_cls:
+                        continue
                 arg = '/?'
             else:
                 arg = '--version'
@@ -530,11 +560,19 @@ class Environment:
                 cls = ClangCCompiler if lang == 'c' else ClangCPPCompiler
                 return cls(ccache + compiler, version, cltype, is_cross, exe_wrap)
             if 'Microsoft' in out or 'Microsoft' in err:
-                # Visual Studio prints version number to stderr but
-                # everything else to stdout. Why? Lord only knows.
+                # Latest versions of Visual Studio print version
+                # number to stderr but earlier ones print version
+                # on stdout.  Why? Lord only knows.
+                # Check both outputs to figure out version.
                 version = search_version(err)
+                if version == 'unknown version':
+                    version = search_version(out)
+                if version == 'unknown version':
+                    m = 'Failed to detect MSVC compiler arch: stderr was\n{!r}'
+                    raise EnvironmentException(m.format(err))
+                is_64 = err.split('\n')[0].endswith(' x64')
                 cls = VisualStudioCCompiler if lang == 'c' else VisualStudioCPPCompiler
-                return cls(compiler, version, is_cross, exe_wrap)
+                return cls(compiler, version, is_cross, exe_wrap, is_64)
             if '(ICC)' in out:
                 # TODO: add microsoft add check OSX
                 inteltype = ICC_STANDARD
@@ -677,7 +715,10 @@ class Environment:
         raise EnvironmentException('Unknown compiler "' + ' '.join(exelist) + '"')
 
     def detect_vala_compiler(self):
-        exelist = ['valac']
+        if 'VALAC' in os.environ:
+            exelist = shlex.split(os.environ['VALAC'])
+        else:
+            exelist = ['valac']
         try:
             p, out = Popen_safe(exelist + ['--version'])[0:2]
         except OSError:
@@ -908,9 +949,8 @@ class CrossBuildInfo:
     def parse_datafile(self, filename):
         config = configparser.ConfigParser()
         try:
-            f = open(filename, 'r')
-            config.read_file(f, filename)
-            f.close()
+            with open(filename, 'r') as f:
+                config.read_file(f, filename)
         except FileNotFoundError:
             raise EnvironmentException('File not found: %s.' % filename)
         # This is a bit hackish at the moment.

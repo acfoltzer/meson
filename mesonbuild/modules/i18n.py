@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
 import shutil
 
 from os import path
@@ -20,7 +19,7 @@ from .. import coredata, mesonlib, build
 from ..mesonlib import MesonException
 from . import ModuleReturnValue
 from . import ExtensionModule
-from . import permittedKwargs
+from ..interpreterbase import permittedKwargs
 
 PRESET_ARGS = {
     'glib': [
@@ -72,8 +71,10 @@ class I18nModule(ExtensionModule):
         datadirs = self._get_data_dirs(state, mesonlib.stringlistify(kwargs.pop('data_dirs', [])))
         datadirs = '--datadirs=' + ':'.join(datadirs) if datadirs else None
 
-        command = [state.environment.get_build_command(), '--internal', 'msgfmthelper',
-                   '@INPUT@', '@OUTPUT@', file_type, podir]
+        command = state.environment.get_build_command() + [
+            '--internal', 'msgfmthelper',
+            '@INPUT@', '@OUTPUT@', file_type, podir
+        ]
         if datadirs:
             command.append(datadirs)
 
@@ -81,7 +82,7 @@ class I18nModule(ExtensionModule):
         ct = build.CustomTarget(kwargs['output'] + '_merge', state.subdir, kwargs)
         return ModuleReturnValue(ct, [ct])
 
-    @permittedKwargs({'po_dir', 'data_dirs', 'type', 'languages'})
+    @permittedKwargs({'po_dir', 'data_dirs', 'type', 'languages', 'args', 'preset', 'install'})
     def gettext(self, state, args, kwargs):
         if len(args) != 1:
             raise coredata.MesonException('Gettext requires one positional argument (package name).')
@@ -105,37 +106,42 @@ class I18nModule(ExtensionModule):
         datadirs = '--datadirs=' + ':'.join(datadirs) if datadirs else None
         extra_args = '--extra-args=' + '@@'.join(extra_args) if extra_args else None
 
-        potargs = [state.environment.get_build_command(), '--internal', 'gettext', 'pot', pkg_arg]
+        potargs = state.environment.get_build_command() + ['--internal', 'gettext', 'pot', pkg_arg]
         if datadirs:
             potargs.append(datadirs)
         if extra_args:
             potargs.append(extra_args)
-        pottarget = build.RunTarget(packagename + '-pot', sys.executable, potargs, [], state.subdir)
+        pottarget = build.RunTarget(packagename + '-pot', potargs[0], potargs[1:], [], state.subdir)
 
-        gmoargs = [state.environment.get_build_command(), '--internal', 'gettext', 'gen_gmo']
+        gmoargs = state.environment.get_build_command() + ['--internal', 'gettext', 'gen_gmo']
         if lang_arg:
             gmoargs.append(lang_arg)
-        gmotarget = build.RunTarget(packagename + '-gmo', sys.executable, gmoargs, [], state.subdir)
+        gmotarget = build.RunTarget(packagename + '-gmo', gmoargs[0], gmoargs[1:], [], state.subdir)
 
-        updatepoargs = [state.environment.get_build_command(), '--internal', 'gettext', 'update_po', pkg_arg]
+        updatepoargs = state.environment.get_build_command() + ['--internal', 'gettext', 'update_po', pkg_arg]
         if lang_arg:
             updatepoargs.append(lang_arg)
         if datadirs:
             updatepoargs.append(datadirs)
         if extra_args:
             updatepoargs.append(extra_args)
-        updatepotarget = build.RunTarget(packagename + '-update-po', sys.executable, updatepoargs, [], state.subdir)
+        updatepotarget = build.RunTarget(packagename + '-update-po', updatepoargs[0], updatepoargs[1:], [], state.subdir)
 
-        script = [sys.executable, state.environment.get_build_command()]
-        args = ['--internal', 'gettext', 'install',
-                '--subdir=' + state.subdir,
-                '--localedir=' + state.environment.coredata.get_builtin_option('localedir'),
-                pkg_arg]
-        if lang_arg:
-            args.append(lang_arg)
-        iscript = build.RunScript(script, args)
+        targets = [pottarget, gmotarget, updatepotarget]
 
-        return ModuleReturnValue(None, [pottarget, gmotarget, iscript, updatepotarget])
+        install = kwargs.get('install', True)
+        if install:
+            script = state.environment.get_build_command()
+            args = ['--internal', 'gettext', 'install',
+                    '--subdir=' + state.subdir,
+                    '--localedir=' + state.environment.coredata.get_builtin_option('localedir'),
+                    pkg_arg]
+            if lang_arg:
+                args.append(lang_arg)
+            iscript = build.RunScript(script, args)
+            targets.append(iscript)
+
+        return ModuleReturnValue(None, targets)
 
 def initialize():
     return I18nModule()

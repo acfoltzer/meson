@@ -68,6 +68,16 @@ single quote = 'contains a \' character'
 
 Similarly `\n` gets converted to a newline and `\\\\` to a single backslash.
 
+#### String concatenation
+
+Strings can be concatenated to form a new string using the `+` symbol.
+
+```meson
+str1 = 'abc'
+str2 = 'xyz'
+combined = str1 + '_' + str2 # combined is now abc_xyz
+```
+
 #### Strings running over multiple lines
 
 Strings running over multiple lines can be declared with three single quotes, like this:
@@ -194,11 +204,29 @@ Arrays are delimited by brackets. An array can contain an arbitrary number of ob
 my_array = [1, 2, 'string', some_obj]
 ```
 
-You can add additional items to an array like this:
+Accessing elements of an array can be done via array indexing:
 
 ```meson
-my_array += [ 'foo', 3, 4, another_obj ]
+my_array = [1, 2, 'string', some_obj]
+second_element = my_array[1]
+last_element = my_array[-1]
 ```
+
+You can add more items to an array like this:
+
+```meson
+my_array += ['foo', 3, 4, another_obj]
+```
+
+When adding a single item, you do not need to enclose it in an array:
+
+```meson
+my_array += ['something']
+# This also works
+my_array += 'else'
+```
+
+Note appending to an array will always create a new array object and assign it to `my_array` instead of modifying the original since all objects in Meson are immutable.
 
 #### Array methods
 
@@ -206,7 +234,7 @@ The following methods are defined for all arrays:
 
  - `length`, the size of the array
  - `contains`, returns `true` if the array contains the object given as argument, `false` otherwise
- - `get`, returns the object at the given index, negative indices count from the back of the array, indexing out of bounds is a fatal error
+ - `get`, returns the object at the given index, negative indices count from the back of the array, indexing out of bounds is a fatal error. Provided for backwards-compatibility, it is identical to array indexing.
 
 Function calls
 --

@@ -21,7 +21,7 @@ from io import StringIO
 from ast import literal_eval
 from enum import Enum
 import tempfile
-import mesontest
+from mesonbuild import mtest
 from mesonbuild import environment
 from mesonbuild import mesonlib
 from mesonbuild import mlog
@@ -124,6 +124,8 @@ print_debug = 'MESON_PRINT_TEST_OUTPUT' in os.environ
 do_debug = not {'MESON_PRINT_TEST_OUTPUT', 'TRAVIS', 'APPVEYOR'}.isdisjoint(os.environ)
 no_meson_log_msg = 'No meson-log.txt found.'
 
+system_compiler = None
+
 meson_command = os.path.join(os.getcwd(), 'meson')
 if not os.path.exists(meson_command):
     meson_command += '.py'
@@ -140,9 +142,6 @@ def stop_handler(signal, frame):
     stop = True
 signal.signal(signal.SIGINT, stop_handler)
 signal.signal(signal.SIGTERM, stop_handler)
-
-# Needed when running cross tests because we don't generate prebuilt files
-compiler = None
 
 def setup_commands(optbackend):
     global do_debug, backend, backend_flags
@@ -183,7 +182,7 @@ def get_relative_files_list_from_dir(fromdir):
             paths.append(path)
     return paths
 
-def platform_fix_name(fname):
+def platform_fix_name(fname, compiler):
     if '?lib' in fname:
         if mesonlib.is_cygwin():
             fname = re.sub(r'\?lib(.*)\.dll$', r'cyg\1.dll', fname)
@@ -194,6 +193,16 @@ def platform_fix_name(fname):
         fname = fname[:-4]
         if mesonlib.is_windows() or mesonlib.is_cygwin():
             return fname + '.exe'
+
+    if fname.startswith('?msvc:'):
+        fname = fname[6:]
+        if compiler != 'cl':
+            return None
+
+    if fname.startswith('?gcc:'):
+        fname = fname[5:]
+        if compiler == 'cl':
+            return None
 
     return fname
 
@@ -210,7 +219,9 @@ def validate_install(srcdir, installdir, compiler):
     elif os.path.exists(info_file):
         with open(info_file) as f:
             for line in f:
-                expected[platform_fix_name(line.strip())] = False
+                line = platform_fix_name(line.strip(), compiler)
+                if line:
+                    expected[line] = False
     # Check if expected files were found
     for fname in expected:
         file_path = os.path.join(installdir, fname)
@@ -275,12 +286,12 @@ def run_test_inprocess(testdir):
     os.chdir(testdir)
     test_log_fname = 'meson-logs/testlog.txt'
     try:
-        returncode_test = mesontest.run(['--no-rebuild'])
+        returncode_test = mtest.run(['--no-rebuild'])
         if os.path.exists(test_log_fname):
             test_log = open(test_log_fname, errors='ignore').read()
         else:
             test_log = ''
-        returncode_benchmark = mesontest.run(['--no-rebuild', '--benchmark', '--logbase', 'benchmarklog'])
+        returncode_benchmark = mtest.run(['--no-rebuild', '--benchmark', '--logbase', 'benchmarklog'])
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
@@ -408,14 +419,17 @@ def have_d_compiler():
 def have_objc_compiler():
     with AutoDeletedDir(tempfile.mkdtemp(prefix='b ', dir='.')) as build_dir:
         env = environment.Environment(None, build_dir, None, get_fake_options('/'), [])
-        objc_comp = env.detect_objc_compiler(False)
+        try:
+            objc_comp = env.detect_objc_compiler(False)
+        except:
+            return False
         if not objc_comp:
             return False
         try:
             objc_comp.sanity_check(env.get_scratch_dir(), env)
+            objcpp_comp = env.detect_objc_compiler(False)
         except:
             return False
-        objcpp_comp = env.detect_objc_compiler(False)
         if not objcpp_comp:
             return False
         try:
@@ -436,7 +450,6 @@ def detect_tests_to_run():
         ('failing-meson', 'failing', False),
         ('failing-build', 'failing build', False),
         ('failing-tests', 'failing tests', False),
-        ('prebuilt', 'prebuilt', False),
 
         ('platform-osx', 'osx', not mesonlib.is_osx()),
         ('platform-windows', 'windows', not mesonlib.is_windows() and not mesonlib.is_cygwin()),
@@ -463,10 +476,15 @@ def detect_tests_to_run():
     return gathered_tests
 
 def run_tests(all_tests, log_name_base, extra_args):
-    global stop, executor, futures
+    global logfile
     txtname = log_name_base + '.txt'
+    with open(txtname, 'w', encoding="utf_8") as lf:
+        logfile = lf
+        return _run_tests(all_tests, log_name_base, extra_args)
+
+def _run_tests(all_tests, log_name_base, extra_args):
+    global stop, executor, futures, system_compiler
     xmlname = log_name_base + '.xml'
-    logfile = open(txtname, 'w', encoding="utf_8")
     junit_root = ET.Element('testsuites')
     conf_time = 0
     build_time = 0
@@ -483,6 +501,12 @@ def run_tests(all_tests, log_name_base, extra_args):
         print('Could not determine number of CPUs due to the following reason:' + str(e))
         print('Defaulting to using only one process')
         num_workers = 1
+    # Due to Ninja deficiency, almost 50% of build time
+    # is spent waiting. Do something useful instead.
+    #
+    # Remove this once the following issue has been resolved:
+    # https://github.com/mesonbuild/meson/pull/2082
+    num_workers *= 2
     try:
         executor = conc.ProcessPoolExecutor(max_workers=num_workers)
     except ImportError:
@@ -506,7 +530,7 @@ def run_tests(all_tests, log_name_base, extra_args):
             should_fail = False
             if name.startswith('failing'):
                 should_fail = name.split('failing-')[1]
-            result = executor.submit(run_test, skipped, t, extra_args, compiler, backend, backend_flags, commands, should_fail)
+            result = executor.submit(run_test, skipped, t, extra_args, system_compiler, backend, backend_flags, commands, should_fail)
             futures.append((testname, t, result))
         for (testname, t, result) in futures:
             sys.stdout.flush()
@@ -559,7 +583,7 @@ def check_file(fname):
     with open(fname, 'rb') as f:
         lines = f.readlines()
     for line in lines:
-        if b'\t' in line:
+        if line.startswith(b'\t'):
             print("File %s contains a literal tab on line %d. Only spaces are permitted." % (fname, linenum))
             sys.exit(1)
         if b'\r' in line:
@@ -573,52 +597,6 @@ def check_format():
             if file.endswith('.py') or file.endswith('.build') or file == 'meson_options.txt':
                 fullname = os.path.join(root, file)
                 check_file(fullname)
-
-def pbcompile(compiler, source, objectfile):
-    if compiler == 'cl':
-        cmd = [compiler, '/nologo', '/Fo' + objectfile, '/c', source]
-    else:
-        cmd = [compiler, '-c', source, '-o', objectfile]
-    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def generate_pb_object(compiler, object_suffix):
-    source = 'test cases/prebuilt/1 object/source.c'
-    objectfile = 'test cases/prebuilt/1 object/prebuilt.' + object_suffix
-    pbcompile(compiler, source, objectfile)
-    return objectfile
-
-def generate_pb_static(compiler, object_suffix, static_suffix):
-    source = 'test cases/prebuilt/2 static/libdir/best.c'
-    objectfile = 'test cases/prebuilt/2 static/libdir/best.' + object_suffix
-    stlibfile = 'test cases/prebuilt/2 static/libdir/libbest.' + static_suffix
-    pbcompile(compiler, source, objectfile)
-    if compiler == 'cl':
-        linker = ['lib', '/NOLOGO', '/OUT:' + stlibfile, objectfile]
-    else:
-        linker = ['ar', 'csr', stlibfile, objectfile]
-    subprocess.check_call(linker)
-    os.unlink(objectfile)
-    return stlibfile
-
-def generate_prebuilt():
-    global compiler
-    static_suffix = 'a'
-    if shutil.which('cl'):
-        compiler = 'cl'
-        static_suffix = 'lib'
-    elif shutil.which('cc'):
-        compiler = 'cc'
-    elif shutil.which('gcc'):
-        compiler = 'gcc'
-    else:
-        raise RuntimeError("Could not find C compiler.")
-    if mesonlib.is_windows():
-        object_suffix = 'obj'
-    else:
-        object_suffix = 'o'
-    objectfile = generate_pb_object(compiler, object_suffix)
-    stlibfile = generate_pb_static(compiler, object_suffix, static_suffix)
-    return objectfile, stlibfile
 
 def check_meson_commands_work():
     global backend, meson_command, compile_commands, test_commands, install_commands
@@ -644,6 +622,18 @@ def check_meson_commands_work():
             if pc.returncode != 0:
                 raise RuntimeError('Failed to install {!r}:\n{}\n{}'.format(testdir, e, o))
 
+
+def detect_system_compiler():
+    global system_compiler
+    if shutil.which('cl'):
+        system_compiler = 'cl'
+    elif shutil.which('cc'):
+        system_compiler = 'cc'
+    elif shutil.which('gcc'):
+        system_compiler = 'gcc'
+    else:
+        raise RuntimeError("Could not find C compiler.")
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run the test suite of Meson.")
     parser.add_argument('extra_args', nargs='*',
@@ -653,19 +643,17 @@ if __name__ == '__main__':
     options = parser.parse_args()
     setup_commands(options.backend)
 
+    detect_system_compiler()
     script_dir = os.path.split(__file__)[0]
     if script_dir != '':
         os.chdir(script_dir)
     check_format()
     check_meson_commands_work()
-    pbfiles = generate_prebuilt()
     try:
         all_tests = detect_tests_to_run()
         (passing_tests, failing_tests, skipped_tests) = run_tests(all_tests, 'meson-test-run', options.extra_args)
     except StopException:
         pass
-    for f in pbfiles:
-        os.unlink(f)
     print('\nTotal passed tests:', green(str(passing_tests)))
     print('Total failed tests:', red(str(failing_tests)))
     print('Total skipped tests:', yellow(str(skipped_tests)))
